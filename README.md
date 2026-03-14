@@ -1,207 +1,92 @@
-# Stellar Tip Jar – Smart Contracts
+# Stellar Tip Jar Contracts
 
-This repository contains the **Soroban smart contracts** that power the Stellar Tip Jar platform.
+Rust + Soroban starter repository for a Stellar-based tipping application.
 
-The contracts are responsible for securely handling tip payments between supporters and creators on the Stellar blockchain.
+The `tipjar` smart contract lets supporters tip creators with a Stellar token, tracks creator totals in contract storage, emits on-chain events, and supports creator withdrawals from escrowed balances.
 
-These contracts ensure that funds are transferred transparently and securely without relying on centralized intermediaries.
+## Repository Structure
 
----
+```text
+contracts/
+	tipjar/
+		src/
+			lib.rs
+		Cargo.toml
 
-## Project Overview
+tests/
+scripts/
 
-Stellar Tip Jar is an open-source platform that allows supporters to send tips to creators using Stellar tokens.
-
-Example creator link:
-
-```
-https://tipjar.app/username
-```
-
-When a user sends a tip:
-
-1. The transaction is sent to the smart contract.
-2. The contract validates the payment.
-3. The funds are transferred to the creator’s wallet.
-4. The backend indexes the transaction for display in the frontend.
-
----
-
-## Architecture
-
-The project is structured as a multi-repository system:
-
-```
-stellar-tipjar
-│
-├── stellar-tipjar-frontend
-├── stellar-tipjar-backend
-└── stellar-tipjar-contracts
-```
-
-* **Frontend** – User interface for tipping creators
-* **Backend** – API and transaction indexing
-* **Contracts** – On-chain tipping logic
-
----
-
-## Tech Stack
-
-* Rust
-* Soroban SDK
-* Stellar CLI
-* Cargo
-
----
-
-## Project Structure
-
-```
-contracts
-│
-├── tipjar
-│   ├── src
-│   │   └── lib.rs
-│   └── Cargo.toml
-│
-tests
-│
-scripts
-│
 README.md
+CONTRIBUTING.md
 ```
 
-Explanation:
+## Contract Capabilities
 
-* **contracts/** – Smart contract implementations
-* **tests/** – Contract test cases
-* **scripts/** – Deployment and helper scripts
+- `init(token)`: one-time token configuration.
+- `tip(sender, creator, amount)`: transfers tokens from sender into contract escrow for creator and updates storage totals.
+- `get_total_tips(creator)`: returns total historical tips for creator.
+- `withdraw(creator)`: allows creator to withdraw escrowed tips.
 
----
+## Storage Model
 
-## Core Contract Logic
+The contract stores:
 
-The tip jar contract supports the following operations:
+- token contract address (`DataKey::Token`)
+- creator withdrawable balance (`DataKey::CreatorBalance`)
+- creator total historical tips (`DataKey::CreatorTotal`)
 
-### Send Tip
+## Events
 
-Transfers tokens from the supporter to the creator.
+- `("tip", creator)` with data `(sender, amount)`
+- `("withdraw", creator)` with data `amount`
 
-```
-tip(sender, creator, amount)
-```
+## Prerequisites
 
----
+- Rust toolchain
+- Stellar CLI (`stellar`)
+- Soroban target support for WASM:
 
-### Get Total Tips
-
-Returns the total amount of tips received by a creator.
-
-```
-get_total_tips(creator)
-```
-
----
-
-### Withdraw Tips (optional)
-
-Allows creators to withdraw accumulated tips.
-
-```
-withdraw(creator)
+```bash
+rustup target add wasm32v1-none
 ```
 
----
+## Build
 
-## Getting Started
-
-### Install Stellar CLI
-
-Install the CLI used for working with Soroban contracts.
-
-```
-stellar --version
+```bash
+cargo build -p tipjar --target wasm32v1-none --release
 ```
 
----
+## Test
 
-### Build the contract
-
-```
-cargo build --target wasm32-unknown-unknown --release
+```bash
+cargo test -p tipjar
 ```
 
----
+Unit tests use Soroban's test framework and cover:
 
-### Run tests
+- tipping flow
+- total and withdrawable balance tracking
+- invalid tip amount rejection
 
-```
-cargo test
-```
+## Deploy (Testnet)
 
----
+Use the helper script:
 
-## Deployment
-
-Contracts can be deployed to the **Stellar Testnet** for development and experimentation.
-
-Example deployment command:
-
-```
-stellar contract deploy \
---wasm target/wasm32-unknown-unknown/release/tipjar.wasm \
---network testnet
+```bash
+bash scripts/deploy.sh
 ```
 
-After deployment, the contract ID can be used by the backend and frontend.
-
----
+Or run commands manually with `stellar contract deploy` and `stellar contract invoke`.
 
 ## Contributing
 
-We welcome contributions from smart contract developers.
+See `CONTRIBUTING.md` for:
 
-Ways to contribute:
-
-* Improve contract security
-* Add new tipping features
-* Write additional tests
-* Improve documentation
-
-### Contribution Steps
-
-1. Fork the repository
-2. Create a feature branch
-
-```
-git checkout -b feature/new-feature
-```
-
-3. Commit your changes
-4. Push your branch
-5. Open a Pull Request
-
----
-
-## Roadmap
-
-Planned contract improvements:
-
-* multi-token tipping
-* creator tip statistics
-* tipping messages
-* NFT thank-you rewards
-* tipping leaderboard
-
----
+- branching strategy
+- coding standards
+- test requirements
+- pull request checklist
 
 ## License
 
-MIT License
-
----
-
-## Related Repositories
-
-* stellar-tipjar-frontend
-* stellar-tipjar-backend
+MIT

@@ -1,0 +1,11 @@
+[workspace]
+members = ["contracts/tipjar"]
+resolver = "2"
+
+[workspace.package]
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/your-org/stellar-tipjar-contracts"
+
+[workspace.dependencies]
+soroban-sdk = "22.0.0"
