@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address,
-    Env,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    Address, Env,
 };
 
 #[cfg(test)]
@@ -18,6 +18,10 @@ pub enum DataKey {
     CreatorBalance(Address),
     /// Historical total tips ever received by creator.
     CreatorTotal(Address),
+    /// Emergency pause state (bool).
+    Paused,
+    /// Contract administrator (Address).
+    Admin,
 }
 
 #[contracterror]
@@ -35,18 +39,21 @@ pub struct TipJarContract;
 
 #[contractimpl]
 impl TipJarContract {
-    /// One-time setup to choose the token contract accepted for tips.
-    pub fn init(env: Env, token: Address) {
+    /// One-time setup to choose the token contract and administrator for the TipJar.
+    pub fn init(env: Env, token: Address, admin: Address) {
         if env.storage().instance().has(&DataKey::Token) {
             panic_with_error!(&env, TipJarError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Token, &token);
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
     }
 
     /// Moves `amount` tokens from `sender` into contract escrow for `creator`.
     ///
     /// The sender must authorize this call and have enough token balance.
     pub fn tip(env: Env, sender: Address, creator: Address, amount: i128) {
+        Self::require_not_paused(&env);
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
         }
@@ -77,8 +84,12 @@ impl TipJarContract {
         let next_balance = current_balance + amount;
         let next_total = current_total + amount;
 
-        env.storage().persistent().set(&creator_balance_key, &next_balance);
-        env.storage().persistent().set(&creator_total_key, &next_total);
+        env.storage()
+            .persistent()
+            .set(&creator_balance_key, &next_balance);
+        env.storage()
+            .persistent()
+            .set(&creator_total_key, &next_total);
 
         // Event topics: ("tip", creator). Event data: (sender, amount).
         env.events()
@@ -99,6 +110,7 @@ impl TipJarContract {
 
     /// Allows creator to withdraw their accumulated escrowed tips.
     pub fn withdraw(env: Env, creator: Address) {
+        Self::require_not_paused(&env);
         creator.require_auth();
 
         let key = DataKey::CreatorBalance(creator.clone());
@@ -124,6 +136,38 @@ impl TipJarContract {
             .get(&DataKey::Token)
             .unwrap_or_else(|| panic_with_error!(env, TipJarError::TokenNotInitialized))
     }
+
+    /// Emergency pause to stop all state-changing activities (Admin only).
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+    }
+
+    /// Resume contract activities after an emergency pause (Admin only).
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    /// Internal helper to check if the contract is paused.
+    fn require_not_paused(env: &Env) {
+        let is_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        if is_paused {
+            panic!("Contract is paused");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,23 +175,26 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
-    fn setup() -> (Env, Address, Address) {
+    fn setup() -> (Env, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
 
-        let contract_id = env.register_contract(None, TipJarContract);
+        let admin = Address::generate(&env);
+        let contract_id = env.register(TipJarContract, ());
         let tipjar_client = TipJarContractClient::new(&env, &contract_id);
-        tipjar_client.init(&token_id);
+        tipjar_client.init(&token_id, &admin);
 
-        (env, contract_id, token_id)
+        (env, contract_id, token_id, admin)
     }
 
     #[test]
     fn test_tipping_functionality() {
-        let (env, contract_id, token_id) = setup();
+        let (env, contract_id, token_id, _) = setup();
         let tipjar_client = TipJarContractClient::new(&env, &contract_id);
         let token_client = token::Client::new(&env, &token_id);
         let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
@@ -164,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_balance_tracking_and_withdraw() {
-        let (env, contract_id, token_id) = setup();
+        let (env, contract_id, token_id, _) = setup();
         let tipjar_client = TipJarContractClient::new(&env, &contract_id);
         let token_client = token::Client::new(&env, &token_id);
         let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
@@ -192,9 +239,8 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_invalid_tip_amount() {
-        let (env, contract_id, token_id) = setup();
+        let (env, contract_id, token_id, _) = setup();
         let tipjar_client = TipJarContractClient::new(&env, &contract_id);
-        let token_client = token::Client::new(&env, &token_id);
         let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
         let sender = Address::generate(&env);
         let creator = Address::generate(&env);
@@ -203,9 +249,58 @@ mod tests {
 
         // Zero tips are rejected to prevent accidental or abusive calls.
         tipjar_client.tip(&sender, &creator, &0);
+    }
 
-        // Keep these in scope to avoid accidental unused-variable edits in refactors.
-        let _ = env;
-        let _ = token_client;
+    #[test]
+    fn test_pause_unpause() {
+        let (env, contract_id, _token_id, admin) = setup();
+        let tipjar_client = TipJarContractClient::new(&env, &contract_id);
+
+        tipjar_client.pause(&admin);
+
+        // Normally we'd check a public `is_paused` but there isn't one in the requirements.
+        // We'll verify by attempting a tip.
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        // This should fail
+        let result = tipjar_client.try_tip(&sender, &creator, &100);
+        assert!(result.is_err());
+
+        // Unpause
+        tipjar_client.unpause(&admin);
+
+        // This should now succeed (once we mint tokens)
+        let token_admin_client = token::StellarAssetClient::new(&env, &_token_id);
+        token_admin_client.mint(&sender, &100);
+        tipjar_client.tip(&sender, &creator, &100);
+        assert_eq!(tipjar_client.get_total_tips(&creator), 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_pause_admin_only() {
+        let (env, contract_id, _, _) = setup();
+        let tipjar_client = TipJarContractClient::new(&env, &contract_id);
+        let non_admin = Address::generate(&env);
+
+        tipjar_client.pause(&non_admin);
+    }
+
+    #[test]
+    fn test_withdraw_blocked_when_paused() {
+        let (env, contract_id, token_id, admin) = setup();
+        let tipjar_client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin_client.mint(&sender, &100);
+        tipjar_client.tip(&sender, &creator, &100);
+
+        tipjar_client.pause(&admin);
+
+        let result = tipjar_client.try_withdraw(&creator);
+        assert!(result.is_err());
     }
 }
