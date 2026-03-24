@@ -127,32 +127,32 @@ impl TipJarContract {
         let token_client = token::Client::new(&env, &token);
         let contract_address = env.current_contract_address();
 
-        // Transfer tokens into contract escrow first so creators can withdraw later.
-        token_client.transfer(&sender, &contract_address, &amount);
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::PlatformFee).unwrap_or(0);
+        let fee = Self::calc_fee(amount, fee_bps);
+        let creator_amount = amount - fee;
+
+        // Fee goes directly to treasury; creator portion goes into escrow.
+        if fee > 0 {
+            let treasury: Address = env.storage().instance().get(&DataKey::TreasuryAddress).unwrap();
+            token_client.transfer(&sender, &treasury, &fee);
+
+            let total_fees: i128 = env.storage().instance().get(&DataKey::TotalFeesCollected).unwrap_or(0);
+            env.storage().instance().set(&DataKey::TotalFeesCollected, &(total_fees + fee));
+
+            env.events()
+                .publish((symbol_short!("fee_coll"), treasury), (sender.clone(), fee));
+        }
+
+        token_client.transfer(&sender, &contract_address, &creator_amount);
 
         let creator_balance_key = DataKey::CreatorBalance(creator.clone(), token.clone());
         let creator_total_key = DataKey::CreatorTotal(creator.clone(), token.clone());
 
-        let current_balance: i128 = env
-            .storage()
-            .persistent()
-            .get(&creator_balance_key)
-            .unwrap_or(0);
-        let current_total: i128 = env
-            .storage()
-            .persistent()
-            .get(&creator_total_key)
-            .unwrap_or(0);
+        let next_balance: i128 = env.storage().persistent().get(&creator_balance_key).unwrap_or(0) + creator_amount;
+        let next_total: i128 = env.storage().persistent().get(&creator_total_key).unwrap_or(0) + creator_amount;
 
-        let next_balance = current_balance + amount;
-        let next_total = current_total + amount;
-
-        env.storage()
-            .persistent()
-            .set(&creator_balance_key, &next_balance);
-        env.storage()
-            .persistent()
-            .set(&creator_total_key, &next_total);
+        env.storage().persistent().set(&creator_balance_key, &next_balance);
+        env.storage().persistent().set(&creator_total_key, &next_total);
 
         // Event topics: ("tip", creator, token). Event data: (sender, amount).
         env.events()
