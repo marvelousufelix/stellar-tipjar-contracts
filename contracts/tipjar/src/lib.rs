@@ -4,9 +4,11 @@ pub mod interfaces;
 pub mod integrations;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, Map, String, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
+    token, Address, BytesN, Env, Map, String, Vec,
 };
+
+pub mod upgrade;
 
 #[cfg(test)]
 extern crate std;
@@ -289,8 +291,9 @@ impl TipJarContract {
         let next_balance: i128 = storage.get(&balance_key).unwrap_or(0) + amount;
         let next_total: i128 = storage.get(&total_key).unwrap_or(0) + amount;
 
-        env.storage().persistent().set(&creator_balance_key, &next_balance);
-        env.storage().persistent().set(&creator_total_key, &next_total);
+        let balance_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let total_key = DataKey::CreatorTotal(creator.clone(), token.clone());
+        let storage = env.storage().persistent();
 
         // Record the tip for refund tracking.
         let tip_id = next_tip_id(&env);
@@ -578,6 +581,25 @@ impl TipJarContract {
         admin.require_auth();
         require_any_role(&env, &admin, &[Role::Admin, Role::Moderator]);
         env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    /// Replaces the contract WASM with `new_wasm_hash` (Admin only).
+    /// All storage is preserved automatically by the Soroban host.
+    /// Increments the on-chain version counter and emits an `upgraded` event.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        admin.require_auth();
+        require_role(&env, &admin, Role::Admin);
+
+        let version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(0);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.storage().instance().set(&DataKey::Version, &(version + 1));
+
+        env.events().publish((symbol_short!("upgraded"), admin), version + 1);
+    }
+
+    /// Returns the current upgrade version (0 = never upgraded).
+    pub fn get_version(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::Version).unwrap_or(0)
     }
 
     // ── Internal helpers ────────────────────────────────────────────────────
@@ -2958,5 +2980,83 @@ mod tests {
         // Next tip picks up sponsor2
         let matched2 = client.tip_with_match(&sender, &creator, &token_id, &100);
         assert_eq!(matched2, 100);
+    }
+
+    // ── Upgrade tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_version_initial_is_zero() {
+        let (env, contract_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        assert_eq!(client.get_version(), 0);
+    }
+
+    #[test]
+    fn test_upgrade_increments_version_and_preserves_state() {
+        let (env, contract_id, token_id, admin) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        // Establish some state before upgrading.
+        token_admin.mint(&sender, &500);
+        client.tip(&sender, &creator, &token_id, &500);
+        assert_eq!(client.get_total_tips(&creator, &token_id), 500);
+
+        // Simulate an upgrade using the current WASM hash (no-op replacement).
+        let wasm_hash = env.deployer().upload_contract_wasm(TipJarContract::wasm());
+        client.upgrade(&admin, &wasm_hash);
+
+        // Version bumped.
+        assert_eq!(client.get_version(), 1);
+
+        // State preserved.
+        assert_eq!(client.get_total_tips(&creator, &token_id), 500);
+        assert_eq!(client.get_withdrawable_balance(&creator, &token_id), 500);
+    }
+
+    #[test]
+    fn test_upgrade_multiple_times_increments_version_each_time() {
+        let (env, contract_id, _, admin) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let wasm_hash = env.deployer().upload_contract_wasm(TipJarContract::wasm());
+
+        client.upgrade(&admin, &wasm_hash);
+        assert_eq!(client.get_version(), 1);
+
+        client.upgrade(&admin, &wasm_hash);
+        assert_eq!(client.get_version(), 2);
+    }
+
+    #[test]
+    fn test_upgrade_non_admin_returns_unauthorized() {
+        let (env, contract_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let non_admin = Address::generate(&env);
+        let wasm_hash = env.deployer().upload_contract_wasm(TipJarContract::wasm());
+
+        let result = client.try_upgrade(&non_admin, &wasm_hash);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            TipJarError::Unauthorized.into()
+        );
+        assert_eq!(client.get_version(), 0);
+    }
+
+    #[test]
+    fn test_upgrade_emits_event() {
+        let (env, contract_id, _, admin) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let wasm_hash = env.deployer().upload_contract_wasm(TipJarContract::wasm());
+
+        client.upgrade(&admin, &wasm_hash);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = last.1;
+        let topic_sym: soroban_sdk::Symbol =
+            soroban_sdk::FromVal::from_val(&env, &topics.get(0).unwrap());
+        assert_eq!(topic_sym, soroban_sdk::Symbol::new(&env, "upgraded"));
     }
 }
