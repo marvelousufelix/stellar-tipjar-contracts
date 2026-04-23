@@ -154,6 +154,40 @@ pub struct MatchingProgram {
     pub active: bool,
 }
 
+/// A time-boxed sponsor matching campaign with a budget and expiry.
+///
+/// `match_ratio` is in basis points: 100 = 1:1, 200 = 2:1.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatchingCampaign {
+    pub sponsor: Address,
+    pub creator: Address,
+    pub token: Address,
+    /// Match ratio in basis points (100 = 1:1, 200 = 2:1).
+    pub match_ratio: u32,
+    pub total_budget: i128,
+    pub remaining_budget: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub active: bool,
+}
+
+/// Per-creator withdrawal rate-limit state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalLimits {
+    /// Maximum amount withdrawable within a 24-hour window (0 = unlimited).
+    pub daily_limit: i128,
+    /// Minimum seconds that must elapse between withdrawals (0 = no cooldown).
+    pub cooldown_seconds: u64,
+    /// Ledger timestamp of the last successful withdrawal.
+    pub last_withdrawal: u64,
+    /// Amount already withdrawn in the current 24-hour window.
+    pub withdrawn_today: i128,
+    /// Ledger timestamp when the current 24-hour window started.
+    pub day_start: u64,
+}
+
 /// A single recipient in a split tip, with share in basis points (10 000 = 100%).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,6 +279,16 @@ pub enum DataKey {
     Subscription(Address, Address),
     /// Human-readable reason stored when the contract is paused.
     PauseReason,
+    /// Per-creator withdrawal limit state (token-agnostic).
+    WithdrawalLimits(Address),
+    /// Default withdrawal limits applied when no per-creator limits are set.
+    DefaultWithdrawalLimits,
+    /// Matching campaign by campaign ID.
+    MatchingCampaign(u64),
+    /// Global matching campaign counter.
+    CampaignCounter,
+    /// Campaign IDs indexed under a creator.
+    CreatorCampaigns(Address),
 }
 
 #[contracterror]
@@ -291,6 +335,14 @@ pub enum TipJarError {
     InvalidPercentage = 30,
     /// Contract is paused; state-changing operations are blocked.
     ContractPaused = 31,
+    /// Withdrawal would exceed the creator's daily limit.
+    DailyLimitExceeded = 32,
+    /// Cooldown period since the last withdrawal has not elapsed.
+    CooldownActive = 33,
+    /// No matching campaign exists for the given campaign ID.
+    CampaignNotFound = 34,
+    /// Campaign is still active; sponsor cannot withdraw unused funds yet.
+    CampaignStillActive = 35,
 }
 
 #[contract]
@@ -479,11 +531,13 @@ impl TipJarContract {
         env.storage().persistent().set(&tot_key, &new_tot);
         Self::update_leaderboard_stats(&env, &sender, &creator, amount);
         env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
+        Self::apply_matching_campaigns(&env, &creator, &token, amount);
         tip_id
     }
 
     /// Withdraws the full escrowed balance for `creator` in `token`.
     ///
+    /// Enforces per-creator (or default) daily limits and cooldown periods.
     /// Emits `("withdraw", creator)` with data `amount`.
     pub fn withdraw(env: Env, creator: Address, token: Address) {
         Self::require_not_paused(&env);
@@ -494,6 +548,7 @@ impl TipJarContract {
         if amount == 0 {
             panic_with_error!(&env, TipJarError::NothingToWithdraw);
         }
+        Self::check_and_update_withdrawal_limits(&env, &creator, amount);
         env.storage().persistent().set(&bal_key, &0i128);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &creator, &amount);
         env.events().publish((symbol_short!("withdraw"), creator.clone()), amount);
@@ -926,5 +981,308 @@ impl TipJarContract {
                 (sender.clone(), share, r.percentage),
             );
         }
+    }
+
+    // ── withdrawal limits ────────────────────────────────────────────────────
+
+    /// Checks and updates withdrawal limits for `creator`. Panics if exceeded.
+    fn check_and_update_withdrawal_limits(env: &Env, creator: &Address, amount: i128) {
+        let mut limits: WithdrawalLimits = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WithdrawalLimits(creator.clone()))
+            .or_else(|| env.storage().instance().get(&DataKey::DefaultWithdrawalLimits))
+            .unwrap_or(WithdrawalLimits {
+                daily_limit: 0,
+                cooldown_seconds: 0,
+                last_withdrawal: 0,
+                withdrawn_today: 0,
+                day_start: 0,
+            });
+
+        // 0 means unlimited / no cooldown.
+        if limits.daily_limit == 0 && limits.cooldown_seconds == 0 {
+            return;
+        }
+
+        let now = env.ledger().timestamp();
+
+        if limits.cooldown_seconds > 0 && limits.last_withdrawal > 0 {
+            if now - limits.last_withdrawal < limits.cooldown_seconds {
+                panic_with_error!(env, TipJarError::CooldownActive);
+            }
+        }
+
+        if limits.daily_limit > 0 {
+            const DAY: u64 = 86_400;
+            if now - limits.day_start >= DAY {
+                limits.withdrawn_today = 0;
+                limits.day_start = now;
+            }
+            if limits.withdrawn_today + amount > limits.daily_limit {
+                panic_with_error!(env, TipJarError::DailyLimitExceeded);
+            }
+            limits.withdrawn_today += amount;
+        }
+
+        limits.last_withdrawal = now;
+        env.storage()
+            .persistent()
+            .set(&DataKey::WithdrawalLimits(creator.clone()), &limits);
+    }
+
+    /// Sets the default withdrawal limits applied to all creators without custom limits.
+    ///
+    /// Pass `daily_limit = 0` for unlimited and `cooldown_seconds = 0` for no cooldown.
+    /// Admin only.
+    pub fn set_default_withdrawal_limits(
+        env: Env,
+        admin: Address,
+        daily_limit: i128,
+        cooldown_seconds: u64,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        let limits = WithdrawalLimits {
+            daily_limit,
+            cooldown_seconds,
+            last_withdrawal: 0,
+            withdrawn_today: 0,
+            day_start: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultWithdrawalLimits, &limits);
+    }
+
+    /// Sets custom withdrawal limits for a specific creator. Admin only.
+    pub fn set_creator_withdrawal_limits(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        daily_limit: i128,
+        cooldown_seconds: u64,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        let limits = WithdrawalLimits {
+            daily_limit,
+            cooldown_seconds,
+            last_withdrawal: 0,
+            withdrawn_today: 0,
+            day_start: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::WithdrawalLimits(creator), &limits);
+    }
+
+    /// Emergency withdrawal bypassing limits. Admin only.
+    ///
+    /// Emits `("emg_wdraw", creator)` with data `amount`.
+    pub fn emergency_withdraw(env: Env, admin: Address, creator: Address, token: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let amount: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        if amount == 0 {
+            panic_with_error!(&env, TipJarError::NothingToWithdraw);
+        }
+        env.storage().persistent().set(&bal_key, &0i128);
+        token::Client::new(&env, &token)
+            .transfer(&env.current_contract_address(), &creator, &amount);
+        env.events()
+            .publish((symbol_short!("emg_wdraw"), creator), amount);
+    }
+
+    // ── matching campaigns ───────────────────────────────────────────────────
+
+    /// Creates a time-boxed matching campaign funded by `sponsor`.
+    ///
+    /// `match_ratio` is in basis points (100 = 1:1, 200 = 2:1).
+    /// `duration_days` sets how long the campaign runs from now.
+    ///
+    /// Transfers `budget` from sponsor into contract escrow.
+    /// Emits `("campaign", sponsor)` with data `(creator, campaign_id, budget)`.
+    /// Returns the new campaign ID.
+    pub fn create_matching_campaign(
+        env: Env,
+        sponsor: Address,
+        creator: Address,
+        token: Address,
+        match_ratio: u32,
+        budget: i128,
+        duration_days: u32,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sponsor.require_auth();
+        if budget <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        if match_ratio == 0 {
+            panic_with_error!(&env, TipJarError::InvalidMatchRatio);
+        }
+
+        token::Client::new(&env, &token)
+            .transfer(&sponsor, &env.current_contract_address(), &budget);
+
+        let campaign_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CampaignCounter)
+            .unwrap_or(0u64);
+
+        let now = env.ledger().timestamp();
+        let campaign = MatchingCampaign {
+            sponsor: sponsor.clone(),
+            creator: creator.clone(),
+            token,
+            match_ratio,
+            total_budget: budget,
+            remaining_budget: budget,
+            start_time: now,
+            end_time: now + (duration_days as u64 * 86_400),
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MatchingCampaign(campaign_id), &campaign);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CampaignCounter, &(campaign_id + 1));
+
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorCampaigns(creator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(campaign_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CreatorCampaigns(creator.clone()), &ids);
+
+        env.events().publish(
+            (symbol_short!("campaign"), sponsor),
+            (creator, campaign_id, budget),
+        );
+
+        campaign_id
+    }
+
+    /// Applies active matching campaigns when a tip is made to `creator`.
+    ///
+    /// Called internally by `tip`. Adds matched amounts to the creator's balance.
+    fn apply_matching_campaigns(env: &Env, creator: &Address, token: &Address, tip_amount: i128) {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorCampaigns(creator.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let now = env.ledger().timestamp();
+
+        for campaign_id in ids.iter() {
+            let key = DataKey::MatchingCampaign(campaign_id);
+            let mut campaign: MatchingCampaign = match env.storage().persistent().get(&key) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if !campaign.active
+                || now < campaign.start_time
+                || now > campaign.end_time
+                || campaign.remaining_budget <= 0
+                || &campaign.token != token
+            {
+                continue;
+            }
+
+            let match_amount = (tip_amount * campaign.match_ratio as i128) / 100;
+            let actual_match = match_amount.min(campaign.remaining_budget);
+            if actual_match <= 0 {
+                continue;
+            }
+
+            campaign.remaining_budget -= actual_match;
+            env.storage().persistent().set(&key, &campaign);
+
+            let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+            let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+            env.storage().persistent().set(&bal_key, &(bal + actual_match));
+
+            env.events().publish(
+                (symbol_short!("match"), creator.clone()),
+                (campaign_id, actual_match),
+            );
+        }
+    }
+
+    /// Allows a sponsor to withdraw unused funds from an expired campaign.
+    ///
+    /// Emits `("camp_wdraw", sponsor)` with data `(campaign_id, amount)`.
+    pub fn withdraw_campaign_funds(env: Env, sponsor: Address, campaign_id: u64) {
+        sponsor.require_auth();
+        let key = DataKey::MatchingCampaign(campaign_id);
+        let mut campaign: MatchingCampaign = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::CampaignNotFound));
+
+        if campaign.sponsor != sponsor {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if env.ledger().timestamp() <= campaign.end_time {
+            panic_with_error!(&env, TipJarError::CampaignStillActive);
+        }
+
+        let refund = campaign.remaining_budget;
+        if refund > 0 {
+            token::Client::new(&env, &campaign.token)
+                .transfer(&env.current_contract_address(), &sponsor, &refund);
+            campaign.remaining_budget = 0;
+        }
+        campaign.active = false;
+        env.storage().persistent().set(&key, &campaign);
+
+        env.events().publish(
+            (symbol_short!("camp_wdraw"), sponsor),
+            (campaign_id, refund),
+        );
+    }
+
+    /// Returns all active campaigns for `creator`.
+    pub fn get_active_campaigns(env: Env, creator: Address) -> Vec<MatchingCampaign> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorCampaigns(creator))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut result = Vec::new(&env);
+
+        for campaign_id in ids.iter() {
+            if let Some(c) = env
+                .storage()
+                .persistent()
+                .get::<_, MatchingCampaign>(&DataKey::MatchingCampaign(campaign_id))
+            {
+                if c.active && now <= c.end_time {
+                    result.push_back(c);
+                }
+            }
+        }
+        result
     }
 }
