@@ -33,6 +33,44 @@ Whitelists a token for use in tips. Admin only.
 
 - Panics: `Unauthorized` if caller is not the stored admin.
 
+### Delegation
+
+#### `delegate_withdrawal(creator: Address, delegate: Address, max_amount: i128, duration: u64)`
+Authorizes a delegate to withdraw up to `max_amount` on behalf of `creator` for `duration` seconds.
+
+- Requires auth from `creator`.
+- Panics: `InvalidAmount` if `max_amount <= 0`.
+- Panics: `InvalidDuration` if `duration == 0`.
+- Emits: `("delegate",)` → `(creator, delegate, max_amount, expires_at)`.
+
+#### `withdraw_as_delegate(delegate: Address, creator: Address, token: Address, amount: i128)`
+Lets an authorized delegate withdraw `amount` from the creator's balance.
+
+- Requires auth from `delegate`.
+- Panics: `DelegationNotFound` if no delegation exists.
+- Panics: `DelegationInactive` if the delegation was revoked or already used.
+- Panics: `DelegationExpired` if the delegation has passed its expiration time.
+- Panics: `DelegationLimitExceeded` if the withdrawal exceeds the authorized cap.
+- Panics: `NothingToWithdraw` if the creator has no available balance.
+- Emits: `("delegate_withdraw",)` → `(creator, delegate, amount, token)`.
+
+#### `revoke_delegation(creator: Address, delegate: Address)`
+Revokes an active delegation. Only the creator may revoke.
+
+- Requires auth from `creator`.
+- Panics: `DelegationNotFound` if no delegation exists.
+- Panics: `DelegationInactive` if the delegation is already inactive.
+- Emits: `("delegate_revoked",)` → `(creator, delegate)`.
+
+#### `get_delegation(creator: Address, delegate: Address) -> Option<Delegation>`
+Returns the active delegation record.
+
+#### `get_delegates(creator: Address) -> Vec<Address>`
+Returns the currently active delegate addresses.
+
+#### `get_delegation_history(creator: Address) -> Vec<Delegation>`
+Returns all delegation state snapshots for the creator.
+
 ### Tipping
 
 #### `tip(sender: Address, creator: Address, token: Address, amount: i128) -> u64`
@@ -125,6 +163,9 @@ Upgrades the contract WASM. Admin only. Increments the on-chain version.
 | `Subscription(subscriber, creator)` | `Subscription` | Recurring tip state |
 | `Paused` | `bool` | Emergency pause flag |
 | `PauseReason` | `String` | Human-readable pause reason |
+| `Delegation(creator, delegate)` | `Delegation` | Active delegation record |
+| `Delegates(creator)` | `Vec<Address>` | Active delegate list |
+| `DelegationHistory(creator)` | `Vec<Delegation>` | Delegation history snapshots |
 | `ContractVersion` | `u32` | Incremented on each upgrade |
 
 ## Error Codes
@@ -146,6 +187,11 @@ Upgrades the contract WASM. Admin only. Increments the on-chain version.
 | 30 | `InvalidPercentage` | Individual share is zero |
 | 31 | `ContractPaused` | Contract is paused |
 | 32 | `MemoTooLong` | Memo exceeds 200 characters |
+| 44 | `DelegationNotFound` | No delegation exists for this creator/delegate pair |
+| 45 | `DelegationExpired` | Delegation has expired |
+| 46 | `DelegationInactive` | Delegation has been revoked or deactivated |
+| 47 | `DelegationLimitExceeded` | Requested delegate withdrawal exceeds allowed limit |
+| 48 | `InvalidDuration` | Delegation duration must be greater than zero |
 
 ## Data Structures
 
@@ -155,6 +201,15 @@ pub struct TipWithMemo {
     pub amount: i128,
     pub memo: Option<String>,  // max 200 UTF-8 chars
     pub timestamp: u64,        // ledger timestamp
+}
+
+pub struct Delegation {
+    pub creator: Address,
+    pub delegate: Address,
+    pub max_amount: i128,
+    pub used_amount: i128,
+    pub expires_at: u64,
+    pub active: bool,
 }
 
 pub struct CreatorStats {

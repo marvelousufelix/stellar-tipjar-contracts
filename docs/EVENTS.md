@@ -83,8 +83,34 @@ data:   400
 
 ---
 
-## `tip_expired`
+## `delegate`
 
+Emitted when a creator grants withdrawal authorization to a delegate.
+
+**Topics**
+
+| Position | Value | Type |
+|---|---|---|
+| 0 | `"delegate"` | `Symbol` |
+| 1 | `creator` | `Address` |
+
+**Data**
+
+| Field | Type | Description |
+|---|---|---|
+| `delegate` | `Address` | The authorized delegate address |
+| `max_amount` | `i128` | Lifetime withdrawal cap for the delegation |
+| `expires_at` | `u64` | Expiry timestamp for the delegation |
+
+**Example (conceptual)**
+```
+topics: ["delegate", "GCREATOR..."]
+data:   ["GDELEGATE...", 300, 1_800_000_100]
+```
+
+---
+
+## `delegate_withdraw`\n\nEmitted when a delegate successfully withdraws on behalf of a creator.\n\n**Topics**\n\n| Position | Value | Type |\n|---|---|---|\n| 0 | `\"del_wdr\"` | `Symbol` |\n| 1 | `creator` | `Address` |\n\n**Data**\n\n| Field | Type | Description |\n|---|---|---|\n| `delegate` | `Address` | The delegate that withdrew funds |\n| `amount` | `i128` | Amount withdrawn |\n| `token` | `Address` | The token asset withdrawn |\n\n**Example (conceptual)**\n```\ntopics: [\"del_wdr\", \"GCREATOR...\"]\ndata:   [\"GDELEGATE...\", 200, \"GTOKEN...\"]\n```\n\n---\n\n## `delegate_revoked`\n\nEmitted when a creator revokes a delegation.\n\n**Topics**\n\n| Position | Value | Type |\n|---|---|---|\n| 0 | `\"del_rev\"` | `Symbol` |\n| 1 | `creator` | `Address` |\n\n**Data**\n\n| Field | Type | Description |\n|---|---|---|\n| `delegate` | `Address` | The delegate that was revoked |\n\n**Example (conceptual)**\n```\ntopics: [\"del_rev\", \"GCREATOR...\"]\ndata:   [\"GDELEGATE...\"]\n```\n\n---\n\n## `tip_expired`\n
 Emitted when an unclaimed time-locked tip is refunded after its expiration window.
 
 **Topics**

@@ -78,6 +78,17 @@ pub struct TipWithExpiry {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Delegation {
+    pub creator: Address,
+    pub delegate: Address,
+    pub max_amount: i128,
+    pub used_amount: i128,
+    pub expires_at: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Milestone {
     pub id: u64,
     pub creator: Address,
@@ -406,6 +417,12 @@ pub enum DataKey {
     CreatorLocks(Address),
     /// Active time-lock IDs for expiration processing.
     ActiveTimeLocks,
+    /// Active delegations keyed by (creator, delegate).
+    Delegation(Address, Address),
+    /// List of active delegate addresses for a creator.
+    Delegates(Address),
+    /// Historical delegation snapshots for a creator.
+    DelegationHistory(Address),
     /// Time-lock record keyed by lock ID.
     TimeLock(u64),
     /// Multi-sig withdrawal request keyed by request ID.
@@ -484,6 +501,16 @@ pub enum TipJarError {
     AlreadyApproved = 42,
     /// Multi-sig config has not been set.
     MultiSigNotConfigured = 43,
+    /// No delegation exists for this creator/delegate pair.
+    DelegationNotFound = 44,
+    /// Delegation has expired.
+    DelegationExpired = 45,
+    /// Delegation has been revoked or deactivated.
+    DelegationInactive = 46,
+    /// Requested delegate withdrawal exceeds allowed limit.
+    DelegationLimitExceeded = 47,
+    /// Delegation duration must be greater than zero.
+    InvalidDuration = 48,
 }
 
 #[contract]
@@ -706,6 +733,217 @@ impl TipJarContract {
         env.storage().persistent().set(&bal_key, &0i128);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &creator, &amount);
         events::emit_withdraw_event(&env, &creator, amount, &token);
+    }
+
+    /// Authorizes a delegate to withdraw on behalf of `creator`.
+    ///
+    /// `max_amount` is the lifetime cap and `duration` is seconds until expiry.
+    /// Emits `("delegate", creator)` with data `(delegate, max_amount, expires_at)`.
+    pub fn delegate_withdrawal(
+        env: Env,
+        creator: Address,
+        delegate: Address,
+        max_amount: i128,
+        duration: u64,
+    ) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+        if max_amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        if duration == 0 {
+            panic_with_error!(&env, TipJarError::InvalidDuration);
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(duration);
+        let delegation = Delegation {
+            creator: creator.clone(),
+            delegate: delegate.clone(),
+            max_amount,
+            used_amount: 0,
+            expires_at,
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+        Self::add_delegate(&env, &creator, &delegate);
+        Self::append_delegation_history(&env, &creator, &delegation);
+
+        env.events().publish(
+            (symbol_short!("delegate"),),
+            (creator, delegate, max_amount, expires_at),
+        );
+    }
+
+    /// Withdraws `amount` from `creator` balance to `delegate` when authorized.
+    ///
+    /// Enforces the creator's withdrawal limits and the delegation cap.
+    /// Emits `("delegate_withdraw", creator)` with data `(delegate, amount, token)`.
+    pub fn withdraw_as_delegate(
+        env: Env,
+        delegate: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        delegate.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let mut delegation: Delegation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(creator.clone(), delegate.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DelegationNotFound));
+
+        if !delegation.active {
+            panic_with_error!(&env, TipJarError::DelegationInactive);
+        }
+        let now = env.ledger().timestamp();
+        if now > delegation.expires_at {
+            delegation.active = false;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+            Self::remove_delegate(&env, &creator, &delegate);
+            Self::append_delegation_history(&env, &creator, &delegation);
+            panic_with_error!(&env, TipJarError::DelegationExpired);
+        }
+        if delegation.used_amount.checked_add(amount).unwrap_or(i128::MAX) > delegation.max_amount {
+            panic_with_error!(&env, TipJarError::DelegationLimitExceeded);
+        }
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let balance: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        if amount > balance || balance == 0 {
+            panic_with_error!(&env, TipJarError::NothingToWithdraw);
+        }
+
+        Self::check_and_update_withdrawal_limits(&env, &creator, amount);
+
+        env.storage().persistent().set(&bal_key, &(balance - amount));
+        delegation.used_amount += amount;
+        if delegation.used_amount >= delegation.max_amount {
+            delegation.active = false;
+            Self::remove_delegate(&env, &creator, &delegate);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+        Self::append_delegation_history(&env, &creator, &delegation);
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &delegate,
+            &amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("del_wdr"),),
+            (creator, delegate, amount, token),
+        );
+    }
+
+    /// Revokes an active delegation. Only the creator may revoke.
+    /// Emits `("delegate_revoked", creator)` with data `(delegate,)`.
+    pub fn revoke_delegation(env: Env, creator: Address, delegate: Address) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let mut delegation: Delegation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(creator.clone(), delegate.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DelegationNotFound));
+
+        if !delegation.active {
+            panic_with_error!(&env, TipJarError::DelegationInactive);
+        }
+
+        delegation.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+        Self::remove_delegate(&env, &creator, &delegate);
+        Self::append_delegation_history(&env, &creator, &delegation);
+
+        env.events().publish(
+            (symbol_short!("del_rev"),),
+            (creator, delegate),
+        );
+    }
+
+    /// Returns the active delegation record for `creator` and `delegate`.
+    pub fn get_delegation(
+        env: Env,
+        creator: Address,
+        delegate: Address,
+    ) -> Option<Delegation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Delegation(creator, delegate))
+    }
+
+    /// Returns the active delegate addresses for `creator`.
+    pub fn get_delegates(env: Env, creator: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Delegates(creator))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the historical delegation snapshots for `creator`.
+    pub fn get_delegation_history(env: Env, creator: Address) -> Vec<Delegation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DelegationHistory(creator))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn add_delegate(env: &Env, creator: &Address, delegate: &Address) {
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegates(creator.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if !delegates.contains(delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&DataKey::Delegates(creator.clone()), &delegates);
+        }
+    }
+
+    fn remove_delegate(env: &Env, creator: &Address, delegate: &Address) {
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegates(creator.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut remaining = Vec::new(env);
+        for d in delegates.iter() {
+            if d != delegate {
+                remaining.push_back(d);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegates(creator.clone()), &remaining);
+    }
+
+    fn append_delegation_history(env: &Env, creator: &Address, delegation: &Delegation) {
+        let mut history: Vec<Delegation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationHistory(creator.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        history.push_back(delegation.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationHistory(creator.clone()), &history);
     }
 
     /// Returns the current withdrawable balance for `creator` in `token`.
