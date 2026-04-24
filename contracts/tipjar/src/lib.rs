@@ -260,6 +260,23 @@ pub struct TimeLock {
     pub cancelled: bool,
 }
 
+/// Leaderboard category selector.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaderboardType {
+    TopTippers,
+    TopCreators,
+}
+
+/// Immutable snapshot of key contract state for migration / audit purposes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateSnapshot {
+    pub snapshot_id: u64,
+    pub timestamp: u64,
+    pub metadata: soroban_sdk::String,
+}
+
 /// Storage layout for persistent contract data.
 #[derive(Clone)]
 #[contracttype]
@@ -336,6 +353,16 @@ pub enum DataKey {
     Snapshot(u64),
     /// Next snapshot ID counter.
     LatestSnapshot,
+    /// Per-creator withdrawal rate-limit state.
+    WithdrawalLimits(Address),
+    /// Platform-wide default withdrawal limits applied when no per-creator config exists.
+    DefaultWithdrawalLimits,
+    /// Next time-lock ID counter (u64).
+    NextLockId,
+    /// List of lock IDs belonging to a creator.
+    CreatorLocks(Address),
+    /// Time-lock record keyed by lock ID.
+    TimeLock(u64),
 }
 
 #[contracterror]
@@ -390,6 +417,10 @@ pub enum TipJarError {
     NotUnlocked = 34,
     /// Time-lock has already been cancelled.
     LockCancelled = 35,
+    /// Cooldown period between withdrawals has not elapsed yet.
+    WithdrawalCooldown = 36,
+    /// Withdrawal would exceed the creator's daily limit.
+    DailyLimitExceeded = 37,
 }
 
 #[contract]
@@ -1422,6 +1453,179 @@ impl TipJarContract {
             }
         }
         locks
+    }
+
+    // ── withdrawal limits ─────────────────────────────────────────────────────
+
+    /// Checks cooldown and daily limit for `creator`, then updates state.
+    ///
+    /// Panics with `WithdrawalCooldown` or `DailyLimitExceeded` on violation.
+    fn check_and_update_withdrawal_limits(env: &Env, creator: &Address, amount: i128) {
+        const DAY_SECS: u64 = 86_400;
+
+        // Resolve per-creator config, falling back to platform default.
+        let mut limits: WithdrawalLimits = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WithdrawalLimits(creator.clone()))
+            .or_else(|| env.storage().instance().get(&DataKey::DefaultWithdrawalLimits))
+            .unwrap_or(WithdrawalLimits {
+                daily_limit: 0,
+                cooldown_seconds: 0,
+                last_withdrawal: 0,
+                withdrawn_today: 0,
+                day_start: 0,
+            });
+
+        let now = env.ledger().timestamp();
+
+        // Cooldown check.
+        if limits.cooldown_seconds > 0 && limits.last_withdrawal > 0 {
+            if now < limits.last_withdrawal + limits.cooldown_seconds {
+                panic_with_error!(env, TipJarError::WithdrawalCooldown);
+            }
+        }
+
+        // Daily window reset.
+        if now >= limits.day_start + DAY_SECS {
+            limits.withdrawn_today = 0;
+            limits.day_start = now;
+        }
+
+        // Daily limit check (0 = unlimited).
+        if limits.daily_limit > 0 {
+            if limits.withdrawn_today + amount > limits.daily_limit {
+                panic_with_error!(env, TipJarError::DailyLimitExceeded);
+            }
+        }
+
+        limits.withdrawn_today += amount;
+        limits.last_withdrawal = now;
+        env.storage()
+            .persistent()
+            .set(&DataKey::WithdrawalLimits(creator.clone()), &limits);
+    }
+
+    /// Sets per-creator withdrawal limits. Admin only.
+    ///
+    /// Pass `daily_limit = 0` for unlimited; `cooldown_seconds = 0` for no cooldown.
+    /// Emits `("wl_set", creator)` with data `(daily_limit, cooldown_seconds)`.
+    pub fn set_withdrawal_limits(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        daily_limit: i128,
+        cooldown_seconds: u64,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let existing: WithdrawalLimits = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WithdrawalLimits(creator.clone()))
+            .unwrap_or(WithdrawalLimits {
+                daily_limit: 0,
+                cooldown_seconds: 0,
+                last_withdrawal: 0,
+                withdrawn_today: 0,
+                day_start: 0,
+            });
+
+        let limits = WithdrawalLimits {
+            daily_limit,
+            cooldown_seconds,
+            last_withdrawal: existing.last_withdrawal,
+            withdrawn_today: existing.withdrawn_today,
+            day_start: existing.day_start,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::WithdrawalLimits(creator.clone()), &limits);
+
+        env.events().publish(
+            (symbol_short!("wl_set"), creator),
+            (daily_limit, cooldown_seconds),
+        );
+    }
+
+    /// Sets platform-wide default withdrawal limits applied to creators without
+    /// a per-creator config. Admin only.
+    ///
+    /// Emits `("wl_def",)` with data `(daily_limit, cooldown_seconds)`.
+    pub fn set_default_withdrawal_limits(
+        env: Env,
+        admin: Address,
+        daily_limit: i128,
+        cooldown_seconds: u64,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let defaults = WithdrawalLimits {
+            daily_limit,
+            cooldown_seconds,
+            last_withdrawal: 0,
+            withdrawn_today: 0,
+            day_start: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultWithdrawalLimits, &defaults);
+
+        env.events()
+            .publish((symbol_short!("wl_def"),), (daily_limit, cooldown_seconds));
+    }
+
+    /// Emergency withdrawal that bypasses limits. Admin only.
+    ///
+    /// Transfers the full escrowed balance for `creator` in `token` directly,
+    /// skipping cooldown and daily-limit checks.
+    /// Emits `("wl_emrg", creator)` with data `amount`.
+    pub fn emergency_withdraw(env: Env, admin: Address, creator: Address, token: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let amount: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        if amount == 0 {
+            panic_with_error!(&env, TipJarError::NothingToWithdraw);
+        }
+
+        env.storage().persistent().set(&bal_key, &0i128);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &creator,
+            &amount,
+        );
+
+        env.events()
+            .publish((symbol_short!("wl_emrg"), creator), amount);
+    }
+
+    /// Returns the withdrawal limits for `creator`, or the platform defaults if
+    /// no per-creator config exists.
+    pub fn get_withdrawal_limits(env: Env, creator: Address) -> WithdrawalLimits {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WithdrawalLimits(creator))
+            .or_else(|| env.storage().instance().get(&DataKey::DefaultWithdrawalLimits))
+            .unwrap_or(WithdrawalLimits {
+                daily_limit: 0,
+                cooldown_seconds: 0,
+                last_withdrawal: 0,
+                withdrawn_today: 0,
+                day_start: 0,
+            })
     }
 
     // ── upgrade / migration ───────────────────────────────────────────────────
