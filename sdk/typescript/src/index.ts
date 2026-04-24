@@ -4,3 +4,4 @@ export * from './events';
 export * from './utils';
 export * from './TipJarContract';
 export * from './client';
+export * from './validation';
