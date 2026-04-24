@@ -67,6 +67,28 @@ pub struct TipWithMessage {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipWithExpiry {
+    pub tipper: Address,
+    pub creator: Address,
+    pub amount: i128,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub claimed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Delegation {
+    pub creator: Address,
+    pub delegate: Address,
+    pub max_amount: i128,
+    pub used_amount: i128,
+    pub expires_at: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Milestone {
     pub id: u64,
     pub creator: Address,
@@ -255,8 +277,11 @@ pub struct Subscription {
 pub struct TimeLock {
     pub sender: Address,
     pub creator: Address,
+    pub token: Address,
     pub amount: i128,
     pub unlock_time: u64,
+    pub created_at: u64,
+    pub expires_at: u64,
     pub cancelled: bool,
 }
 
@@ -390,6 +415,14 @@ pub enum DataKey {
     NextLockId,
     /// List of lock IDs belonging to a creator.
     CreatorLocks(Address),
+    /// Active time-lock IDs for expiration processing.
+    ActiveTimeLocks,
+    /// Active delegations keyed by (creator, delegate).
+    Delegation(Address, Address),
+    /// List of active delegate addresses for a creator.
+    Delegates(Address),
+    /// Historical delegation snapshots for a creator.
+    DelegationHistory(Address),
     /// Time-lock record keyed by lock ID.
     TimeLock(u64),
     /// Multi-sig withdrawal request keyed by request ID.
@@ -468,6 +501,16 @@ pub enum TipJarError {
     AlreadyApproved = 42,
     /// Multi-sig config has not been set.
     MultiSigNotConfigured = 43,
+    /// No delegation exists for this creator/delegate pair.
+    DelegationNotFound = 44,
+    /// Delegation has expired.
+    DelegationExpired = 45,
+    /// Delegation has been revoked or deactivated.
+    DelegationInactive = 46,
+    /// Requested delegate withdrawal exceeds allowed limit.
+    DelegationLimitExceeded = 47,
+    /// Delegation duration must be greater than zero.
+    InvalidDuration = 48,
 }
 
 #[contract]
@@ -690,6 +733,217 @@ impl TipJarContract {
         env.storage().persistent().set(&bal_key, &0i128);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &creator, &amount);
         events::emit_withdraw_event(&env, &creator, amount, &token);
+    }
+
+    /// Authorizes a delegate to withdraw on behalf of `creator`.
+    ///
+    /// `max_amount` is the lifetime cap and `duration` is seconds until expiry.
+    /// Emits `("delegate", creator)` with data `(delegate, max_amount, expires_at)`.
+    pub fn delegate_withdrawal(
+        env: Env,
+        creator: Address,
+        delegate: Address,
+        max_amount: i128,
+        duration: u64,
+    ) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+        if max_amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        if duration == 0 {
+            panic_with_error!(&env, TipJarError::InvalidDuration);
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(duration);
+        let delegation = Delegation {
+            creator: creator.clone(),
+            delegate: delegate.clone(),
+            max_amount,
+            used_amount: 0,
+            expires_at,
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+        Self::add_delegate(&env, &creator, &delegate);
+        Self::append_delegation_history(&env, &creator, &delegation);
+
+        env.events().publish(
+            (symbol_short!("delegate"),),
+            (creator, delegate, max_amount, expires_at),
+        );
+    }
+
+    /// Withdraws `amount` from `creator` balance to `delegate` when authorized.
+    ///
+    /// Enforces the creator's withdrawal limits and the delegation cap.
+    /// Emits `("delegate_withdraw", creator)` with data `(delegate, amount, token)`.
+    pub fn withdraw_as_delegate(
+        env: Env,
+        delegate: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        delegate.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let mut delegation: Delegation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(creator.clone(), delegate.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DelegationNotFound));
+
+        if !delegation.active {
+            panic_with_error!(&env, TipJarError::DelegationInactive);
+        }
+        let now = env.ledger().timestamp();
+        if now > delegation.expires_at {
+            delegation.active = false;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+            Self::remove_delegate(&env, &creator, &delegate);
+            Self::append_delegation_history(&env, &creator, &delegation);
+            panic_with_error!(&env, TipJarError::DelegationExpired);
+        }
+        if delegation.used_amount.checked_add(amount).unwrap_or(i128::MAX) > delegation.max_amount {
+            panic_with_error!(&env, TipJarError::DelegationLimitExceeded);
+        }
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let balance: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        if amount > balance || balance == 0 {
+            panic_with_error!(&env, TipJarError::NothingToWithdraw);
+        }
+
+        Self::check_and_update_withdrawal_limits(&env, &creator, amount);
+
+        env.storage().persistent().set(&bal_key, &(balance - amount));
+        delegation.used_amount += amount;
+        if delegation.used_amount >= delegation.max_amount {
+            delegation.active = false;
+            Self::remove_delegate(&env, &creator, &delegate);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+        Self::append_delegation_history(&env, &creator, &delegation);
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &delegate,
+            &amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("del_wdr"),),
+            (creator, delegate, amount, token),
+        );
+    }
+
+    /// Revokes an active delegation. Only the creator may revoke.
+    /// Emits `("delegate_revoked", creator)` with data `(delegate,)`.
+    pub fn revoke_delegation(env: Env, creator: Address, delegate: Address) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let mut delegation: Delegation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(creator.clone(), delegate.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DelegationNotFound));
+
+        if !delegation.active {
+            panic_with_error!(&env, TipJarError::DelegationInactive);
+        }
+
+        delegation.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+        Self::remove_delegate(&env, &creator, &delegate);
+        Self::append_delegation_history(&env, &creator, &delegation);
+
+        env.events().publish(
+            (symbol_short!("del_rev"),),
+            (creator, delegate),
+        );
+    }
+
+    /// Returns the active delegation record for `creator` and `delegate`.
+    pub fn get_delegation(
+        env: Env,
+        creator: Address,
+        delegate: Address,
+    ) -> Option<Delegation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Delegation(creator, delegate))
+    }
+
+    /// Returns the active delegate addresses for `creator`.
+    pub fn get_delegates(env: Env, creator: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Delegates(creator))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the historical delegation snapshots for `creator`.
+    pub fn get_delegation_history(env: Env, creator: Address) -> Vec<Delegation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DelegationHistory(creator))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn add_delegate(env: &Env, creator: &Address, delegate: &Address) {
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegates(creator.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if !delegates.contains(delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&DataKey::Delegates(creator.clone()), &delegates);
+        }
+    }
+
+    fn remove_delegate(env: &Env, creator: &Address, delegate: &Address) {
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegates(creator.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut remaining = Vec::new(env);
+        for d in delegates.iter() {
+            if d != delegate {
+                remaining.push_back(d);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegates(creator.clone()), &remaining);
+    }
+
+    fn append_delegation_history(env: &Env, creator: &Address, delegation: &Delegation) {
+        let mut history: Vec<Delegation> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationHistory(creator.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        history.push_back(delegation.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationHistory(creator.clone()), &history);
     }
 
     /// Returns the current withdrawable balance for `creator` in `token`.
@@ -1380,11 +1634,20 @@ impl TipJarContract {
             .persistent()
             .get(&DataKey::NextLockId)
             .unwrap_or(0);
+        let created_at = env.ledger().timestamp();
+        let refund_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundWindow)
+            .unwrap_or(0);
         let time_lock = TimeLock {
             sender: sender.clone(),
             creator: creator.clone(),
+            token: token.clone(),
             amount,
             unlock_time,
+            created_at,
+            expires_at: created_at.saturating_add(refund_window),
             cancelled: false,
         };
         env.storage().persistent().set(&DataKey::TimeLock(lock_id), &time_lock);
@@ -1398,6 +1661,8 @@ impl TipJarContract {
         creator_locks.push_back(lock_id);
         env.storage().persistent().set(&DataKey::CreatorLocks(creator.clone()), &creator_locks);
 
+        Self::add_active_time_lock(&env, lock_id);
+
         // External call last.
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
 
@@ -1406,6 +1671,18 @@ impl TipJarContract {
             (sender, amount, unlock_time, lock_id),
         );
         lock_id
+    }
+
+    /// Convenience wrapper matching the public `tip_locked` API.
+    pub fn tip_locked(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        unlock_time: u64,
+    ) -> u64 {
+        Self::tip_time_locked(env, sender, creator, token, amount, unlock_time)
     }
 
     /// Withdraws a time-locked tip after its unlock time. Only `creator` may call.
@@ -1433,6 +1710,7 @@ impl TipJarContract {
 
         // State update before external call (CEI).
         env.storage().persistent().remove(&DataKey::TimeLock(lock_id));
+        Self::remove_active_time_lock(&env, lock_id);
 
         token::Client::new(&env, &token).transfer(
             &env.current_contract_address(),
@@ -1444,6 +1722,11 @@ impl TipJarContract {
             (symbol_short!("unlock"), creator),
             (time_lock.amount, lock_id),
         );
+    }
+
+    /// Convenience wrapper matching the public `withdraw_locked` API.
+    pub fn withdraw_locked(env: Env, creator: Address, token: Address, lock_id: u64) {
+        Self::withdraw_time_locked(env, creator, token, lock_id)
     }
 
     /// Cancels a time-locked tip and refunds the sender. Only the original sender may call.
@@ -1469,6 +1752,7 @@ impl TipJarContract {
         // State update before external call (CEI).
         time_lock.cancelled = true;
         env.storage().persistent().set(&DataKey::TimeLock(lock_id), &time_lock);
+        Self::remove_active_time_lock(&env, lock_id);
 
         token::Client::new(&env, &token).transfer(
             &env.current_contract_address(),
@@ -1480,6 +1764,11 @@ impl TipJarContract {
             (symbol_short!("lk_cncl"), sender),
             (time_lock.amount, lock_id),
         );
+    }
+
+    /// Convenience wrapper matching the public `cancel_locked` API.
+    pub fn cancel_locked(env: Env, sender: Address, token: Address, lock_id: u64) {
+        Self::cancel_time_lock(env, sender, token, lock_id)
     }
 
     /// Returns all time-lock records for `creator`.
@@ -1500,6 +1789,156 @@ impl TipJarContract {
             }
         }
         locks
+    }
+
+    /// Returns a single active locked tip for `creator`.
+    pub fn get_locked_tip(env: Env, creator: Address, lock_id: u64) -> LockedTip {
+        let time_lock: TimeLock = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimeLock(lock_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+
+        if time_lock.creator != creator {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        LockedTip {
+            sender: time_lock.sender.clone(),
+            creator: time_lock.creator.clone(),
+            token: time_lock.token.clone(),
+            amount: time_lock.amount,
+            unlock_timestamp: time_lock.unlock_time,
+        }
+    }
+
+    /// Returns the refund window used to compute tip expiry.
+    pub fn get_refund_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RefundWindow)
+            .unwrap_or(0)
+    }
+
+    /// Updates the refund window used by time-locked tips.
+    /// Admin only.
+    pub fn set_refund_window(env: Env, admin: Address, refund_window_seconds: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundWindow, &refund_window_seconds);
+        env.events().publish((symbol_short!("refund_window"),), refund_window_seconds);
+    }
+
+    /// Returns all expired time-locked tips whose refund window has passed.
+    fn get_expired_time_lock_ids(env: &Env, current_time: u64) -> Vec<u64> {
+        let lock_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveTimeLocks)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut expired = Vec::new(env);
+        for lock_id in lock_ids.iter() {
+            if let Some(lock) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimeLock>(&DataKey::TimeLock(lock_id))
+            {
+                if !lock.cancelled && lock.expires_at <= current_time {
+                    expired.push_back(lock_id);
+                }
+            }
+        }
+        expired
+    }
+
+    /// Processes all expired time-locked tips and refunds their senders.
+    /// Returns the number of refunded tips.
+    pub fn get_expired_time_locks(env: Env) -> Vec<TipWithExpiry> {
+        let current_time = env.ledger().timestamp();
+        let expired_ids = Self::get_expired_time_lock_ids(&env, current_time);
+        let mut result = Vec::new(&env);
+        for lock_id in expired_ids.iter() {
+            if let Some(lock) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimeLock>(&DataKey::TimeLock(lock_id))
+            {
+                result.push_back(TipWithExpiry {
+                    tipper: lock.sender.clone(),
+                    creator: lock.creator.clone(),
+                    amount: lock.amount,
+                    created_at: lock.created_at,
+                    expires_at: lock.expires_at,
+                    claimed: false,
+                });
+            }
+        }
+        result
+    }
+
+    pub fn process_expired_tips(env: Env) -> u32 {
+        let current_time = env.ledger().timestamp();
+        let expired_locks = Self::get_expired_time_lock_ids(&env, current_time);
+        let mut refunded_count = 0u32;
+        for lock_id in expired_locks.iter() {
+            if let Some(time_lock) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, TimeLock>(&DataKey::TimeLock(lock_id))
+            {
+                if !time_lock.cancelled {
+                    Self::refund_time_lock(&env, lock_id, &time_lock);
+                    refunded_count += 1;
+                }
+            }
+        }
+        refunded_count
+    }
+
+    fn add_active_time_lock(env: &Env, lock_id: u64) {
+        let mut active: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveTimeLocks)
+            .unwrap_or_else(|| Vec::new(env));
+        if !active.contains(&lock_id) {
+            active.push_back(lock_id);
+        }
+        env.storage().persistent().set(&DataKey::ActiveTimeLocks, &active);
+    }
+
+    fn remove_active_time_lock(env: &Env, lock_id: u64) {
+        let active: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveTimeLocks)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut remaining = Vec::new(env);
+        for id in active.iter() {
+            if id != lock_id {
+                remaining.push_back(id);
+            }
+        }
+        env.storage().persistent().set(&DataKey::ActiveTimeLocks, &remaining);
+    }
+
+    fn refund_time_lock(env: &Env, lock_id: u64, time_lock: &TimeLock) {
+        env.storage().persistent().remove(&DataKey::TimeLock(lock_id));
+        Self::remove_active_time_lock(env, lock_id);
+        token::Client::new(&env, &time_lock.token).transfer(
+            &env.current_contract_address(),
+            &time_lock.sender,
+            &time_lock.amount,
+        );
+        env.events().publish(
+            (symbol_short!("tip_expired"), time_lock.creator.clone()),
+            (time_lock.sender.clone(), time_lock.amount, time_lock.expires_at, lock_id),
+        );
     }
 
     // ── withdrawal limits ─────────────────────────────────────────────────────
