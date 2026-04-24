@@ -39,6 +39,9 @@ pub mod fees;
 // Dispute resolution
 pub mod dispute;
 
+// Privacy features
+pub mod privacy_tip;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -444,6 +447,12 @@ pub enum DataKey {
     DisputeEvidence(u64, u64),
     /// Evidence counter for a dispute.
     DisputeEvidenceCounter(u64),
+    /// Private tip record keyed by tip_id.
+    PrivateTip(u64),
+    /// Global counter for private tip IDs.
+    PrivateTipCounter,
+    /// Revealed amount for a private tip keyed by tip_id.
+    PrivateTipAmount(u64),
 }
 
 #[contracterror]
@@ -530,6 +539,10 @@ pub enum TipJarError {
     DisputeNotOpen = 50,
     /// Only initiator or arbitrator can perform this action.
     DisputeUnauthorized = 51,
+    /// Private tip not found.
+    PrivateTipNotFound = 52,
+    /// Invalid reveal - hash mismatch.
+    InvalidReveal = 53,
 }
 
 #[contract]
@@ -2747,5 +2760,161 @@ impl TipJarContract {
             .persistent()
             .get(&DataKey::Milestone(creator, milestone_id))
             .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MilestoneNotFound))
+    }
+
+    // ── privacy features ──────────────────────────────────────────────────────
+
+    /// Sends an anonymous or private tip. Amount is hashed for privacy.
+    ///
+    /// If `is_anonymous` is true, the tipper identity is not stored.
+    /// Returns the private tip ID.
+    /// Emits `("private_tip",)` with data `(tip_id, creator, is_anonymous)`.
+    pub fn tip_private(
+        env: Env,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        is_anonymous: bool,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        let tip_id: u64 = env.storage().instance().get(&DataKey::PrivateTipCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::PrivateTipCounter, &(tip_id + 1));
+
+        let amount_bytes = amount.to_le_bytes();
+        let amount_hash = env.crypto().sha256(&amount_bytes);
+
+        let tipper = if is_anonymous {
+            None
+        } else {
+            Some(env.current_contract_address())
+        };
+
+        let created_at = env.ledger().timestamp();
+        let private_tip = privacy_tip::PrivateTip {
+            id: tip_id,
+            creator: creator.clone(),
+            amount_hash,
+            is_anonymous,
+            tipper,
+            created_at,
+            revealed: false,
+        };
+
+        env.storage().persistent().set(&DataKey::PrivateTip(tip_id), &private_tip);
+
+        env.events().publish(
+            (symbol_short!("priv_tip"),),
+            (tip_id, creator, is_anonymous),
+        );
+
+        tip_id
+    }
+
+    /// Reveals the amount of a private tip by providing the original amount.
+    ///
+    /// The amount is hashed and compared with the stored hash. If it matches,
+    /// the tip is credited to the creator and marked as revealed.
+    /// Emits `("tip_revealed",)` with data `(tip_id, amount)`.
+    pub fn reveal_tip(
+        env: Env,
+        sender: Address,
+        token: Address,
+        tip_id: u64,
+        amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let mut private_tip: privacy_tip::PrivateTip = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PrivateTip(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::PrivateTipNotFound));
+
+        let amount_bytes = amount.to_le_bytes();
+        let computed_hash = env.crypto().sha256(&amount_bytes);
+
+        if computed_hash != private_tip.amount_hash {
+            panic_with_error!(&env, TipJarError::InvalidReveal);
+        }
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        // Transfer tokens
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee: i128 = (amount * fee_bp as i128) / 10_000;
+        let creator_amount = amount - fee;
+
+        if fee > 0 {
+            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let new_fee_bal: i128 = env
+                .storage()
+                .instance()
+                .get(&fee_key)
+                .unwrap_or(0)
+                .checked_add(fee)
+                .expect("fee overflow");
+            env.storage().instance().set(&fee_key, &new_fee_bal);
+        }
+
+        let bal_key = DataKey::CreatorBalance(private_tip.creator.clone(), token.clone());
+        let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        let new_bal: i128 = existing_bal.checked_add(creator_amount).expect("balance overflow");
+        env.storage().persistent().set(&bal_key, &new_bal);
+
+        let tot_key = DataKey::CreatorTotal(private_tip.creator.clone(), token.clone());
+        let existing_tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+        let new_tot: i128 = existing_tot.checked_add(creator_amount).expect("total overflow");
+        env.storage().persistent().set(&tot_key, &new_tot);
+
+        private_tip.revealed = true;
+        env.storage().persistent().set(&DataKey::PrivateTip(tip_id), &private_tip);
+        env.storage().persistent().set(&DataKey::PrivateTipAmount(tip_id), &amount);
+
+        env.events().publish(
+            (symbol_short!("tip_rev"),),
+            (tip_id, amount),
+        );
+    }
+
+    /// Returns a private tip record by ID.
+    pub fn get_private_tip(env: Env, tip_id: u64) -> privacy_tip::PrivateTip {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PrivateTip(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::PrivateTipNotFound))
+    }
+
+    /// Returns the revealed amount for a private tip (if revealed).
+    pub fn get_private_tip_amount(env: Env, tip_id: u64) -> Option<i128> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PrivateTipAmount(tip_id))
     }
 }
