@@ -36,6 +36,9 @@ pub mod conditions;
 // Dynamic fee adjustment
 pub mod fees;
 
+// Dispute resolution
+pub mod dispute;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -431,6 +434,16 @@ pub enum DataKey {
     MultiSigCounter,
     /// Multi-sig configuration (threshold, signers, required approvals).
     MultiSigConfig,
+    /// Dispute record keyed by dispute_id.
+    Dispute(u64),
+    /// Global counter for dispute IDs.
+    DisputeCounter,
+    /// List of dispute IDs for a creator.
+    CreatorDisputes(Address),
+    /// Evidence records keyed by (dispute_id, evidence_index).
+    DisputeEvidence(u64, u64),
+    /// Evidence counter for a dispute.
+    DisputeEvidenceCounter(u64),
 }
 
 #[contracterror]
@@ -511,6 +524,12 @@ pub enum TipJarError {
     DelegationLimitExceeded = 47,
     /// Delegation duration must be greater than zero.
     InvalidDuration = 48,
+    /// Dispute not found.
+    DisputeNotFound = 49,
+    /// Dispute is not in Open status.
+    DisputeNotOpen = 50,
+    /// Only initiator or arbitrator can perform this action.
+    DisputeUnauthorized = 51,
 }
 
 #[contract]
@@ -2336,5 +2355,191 @@ impl TipJarContract {
             // v1 → v2: no data migration required in this example.
             _ => {}
         }
+    }
+
+    // ── dispute resolution ────────────────────────────────────────────────────
+
+    /// Creates a dispute for a tip. Only the tipper or creator can initiate.
+    ///
+    /// Emits `("dispute_created",)` with data `(dispute_id, tip_id, initiator)`.
+    pub fn create_dispute(
+        env: Env,
+        tip_id: u64,
+        initiator: Address,
+        reason: String,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        initiator.require_auth();
+
+        let dispute_id: u64 = env.storage().instance().get(&DataKey::DisputeCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::DisputeCounter, &(dispute_id + 1));
+
+        let created_at = env.ledger().timestamp();
+        let dispute = dispute::Dispute {
+            id: dispute_id,
+            tip_id,
+            initiator: initiator.clone(),
+            reason,
+            status: dispute::DisputeStatus::Open,
+            arbitrator: None,
+            resolution: None,
+            created_at,
+        };
+
+        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+
+        let mut creator_disputes: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorDisputes(initiator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        creator_disputes.push_back(dispute_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CreatorDisputes(initiator.clone()), &creator_disputes);
+
+        env.events().publish(
+            (symbol_short!("disp_crt"),),
+            (dispute_id, tip_id, initiator),
+        );
+
+        dispute_id
+    }
+
+    /// Assigns an arbitrator to a dispute. Admin only.
+    ///
+    /// Emits `("dispute_assigned",)` with data `(dispute_id, arbitrator)`.
+    pub fn assign_arbitrator(env: Env, admin: Address, dispute_id: u64, arbitrator: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let mut dispute: dispute::Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound));
+
+        dispute.arbitrator = Some(arbitrator.clone());
+        dispute.status = dispute::DisputeStatus::UnderReview;
+        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+
+        env.events().publish(
+            (symbol_short!("disp_asgn"),),
+            (dispute_id, arbitrator),
+        );
+    }
+
+    /// Submits evidence for a dispute.
+    ///
+    /// Emits `("evidence_submitted",)` with data `(dispute_id, submitter)`.
+    pub fn submit_evidence(
+        env: Env,
+        dispute_id: u64,
+        submitter: Address,
+        evidence: String,
+    ) {
+        Self::require_not_paused(&env);
+        submitter.require_auth();
+
+        let dispute: dispute::Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound));
+
+        if dispute.status != dispute::DisputeStatus::Open && dispute.status != dispute::DisputeStatus::UnderReview {
+            panic_with_error!(&env, TipJarError::DisputeNotOpen);
+        }
+
+        let evidence_idx: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidenceCounter(dispute_id))
+            .unwrap_or(0);
+
+        let submitted_at = env.ledger().timestamp();
+        let evidence_record = dispute::DisputeEvidence {
+            dispute_id,
+            submitter: submitter.clone(),
+            evidence,
+            submitted_at,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeEvidence(dispute_id, evidence_idx), &evidence_record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeEvidenceCounter(dispute_id), &(evidence_idx + 1));
+
+        env.events().publish(
+            (symbol_short!("evid_sub"),),
+            (dispute_id, submitter),
+        );
+    }
+
+    /// Resolves a dispute. Only the arbitrator can resolve.
+    ///
+    /// Emits `("dispute_resolved",)` with data `(dispute_id, resolution)`.
+    pub fn resolve_dispute(
+        env: Env,
+        dispute_id: u64,
+        arbitrator: Address,
+        resolution: String,
+        approved: bool,
+    ) {
+        Self::require_not_paused(&env);
+        arbitrator.require_auth();
+
+        let mut dispute: dispute::Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound));
+
+        if dispute.arbitrator != Some(arbitrator.clone()) {
+            panic_with_error!(&env, TipJarError::DisputeUnauthorized);
+        }
+
+        dispute.resolution = Some(resolution.clone());
+        dispute.status = if approved {
+            dispute::DisputeStatus::Resolved
+        } else {
+            dispute::DisputeStatus::Rejected
+        };
+
+        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+
+        env.events().publish(
+            (symbol_short!("disp_res"),),
+            (dispute_id, resolution),
+        );
+    }
+
+    /// Returns a dispute by ID.
+    pub fn get_dispute(env: Env, dispute_id: u64) -> dispute::Dispute {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound))
+    }
+
+    /// Returns all disputes for a creator.
+    pub fn get_creator_disputes(env: Env, creator: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CreatorDisputes(creator))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns evidence for a dispute.
+    pub fn get_dispute_evidence(env: Env, dispute_id: u64, evidence_idx: u64) -> dispute::DisputeEvidence {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidence(dispute_id, evidence_idx))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound))
     }
 }
