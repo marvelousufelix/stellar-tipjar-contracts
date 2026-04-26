@@ -52,3 +52,7 @@ path = "tests/multisig_withdrawal_tests.rs"
 [[test]]
 name = "multi_token_tests"
 path = "tests/multi_token_tests.rs"
+
+[[test]]
+name = "subscription_tiers"
+path = "tests/subscription_tiers.rs"
