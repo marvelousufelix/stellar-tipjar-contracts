@@ -46,6 +46,9 @@ pub mod privacy_tip;
 // Options trading
 pub mod options;
 
+// Tip rate limiting
+pub mod rate_limit;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -672,6 +675,16 @@ pub enum DataKey {
     BridgeEnabled,
     /// Bridge fee in basis points.
     BridgeFeeBps,
+    /// Subscription tier configuration keyed by tier.
+    TierConfig(SubscriptionTier),
+    /// Rate limit configuration per tier.
+    RateLimitConfig(rate_limit::RateLimitTier),
+    /// Per-sender rate limit state.
+    RateLimitState(Address),
+    /// Rate limit tier assigned to a sender.
+    RateLimitTier(Address),
+    /// Global rate limiting enabled flag.
+    RateLimitEnabled,
 }
 
 #[contracterror]
@@ -850,6 +863,24 @@ pub enum TipJarError {
     OptionNotExpired = 96,
     /// Invalid bridge fee.
     InvalidBridgeFee = 97,
+    /// Vesting duration must be greater than zero.
+    InvalidVestingDuration = 101,
+    /// Cliff duration exceeds vesting duration.
+    CliffExceedsVesting = 102,
+    /// Vesting schedule ID is invalid (zero).
+    InvalidVestingId = 103,
+    /// Vesting schedule not found.
+    VestingScheduleNotFound = 104,
+    /// No vested amount available to withdraw.
+    NoVestedAmount = 105,
+    /// Subscription tier is not configured.
+    TierNotConfigured = 106,
+    /// Tip rate limit exceeded: too many tips in the current window.
+    RateLimitTipCount = 107,
+    /// Tip rate limit exceeded: amount limit reached for the current window.
+    RateLimitAmount = 108,
+    /// Tip rate limit exceeded: minimum interval between tips not elapsed.
+    RateLimitInterval = 109,
 }
 
 #[contract]
@@ -5612,5 +5643,189 @@ impl TipJarContract {
         );
 
         expired_count
+    }
+
+    // ── tip rate limiting ────────────────────────────────────────────────────
+
+    /// Enables or disables tip rate limiting globally. Admin only.
+    ///
+    /// Emits `("rl_en",)` with data `enabled`.
+    pub fn set_rate_limit_enabled(env: Env, admin: Address, enabled: bool) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::RateLimitEnabled, &enabled);
+        env.events().publish((symbol_short!("rl_en"),), enabled);
+    }
+
+    /// Configures rate limits for a specific tier. Admin only.
+    ///
+    /// `max_tips_per_window` — max tip count per window (0 = unlimited).
+    /// `max_amount_per_window` — max total amount per window (0 = unlimited).
+    /// `window_seconds` — rolling window duration in seconds.
+    /// `min_tip_interval` — minimum seconds between tips (0 = no cooldown).
+    ///
+    /// Emits `("rl_cfg",)` with data `(tier, max_tips, max_amount, window_seconds)`.
+    pub fn set_rate_limit_config(
+        env: Env,
+        admin: Address,
+        tier: rate_limit::RateLimitTier,
+        max_tips_per_window: u32,
+        max_amount_per_window: i128,
+        window_seconds: u64,
+        min_tip_interval: u64,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        if window_seconds == 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let config = rate_limit::RateLimitConfig {
+            max_tips_per_window,
+            max_amount_per_window,
+            window_seconds,
+            min_tip_interval,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::RateLimitConfig(tier.clone()), &config);
+        env.events().publish(
+            (symbol_short!("rl_cfg"),),
+            (max_tips_per_window, max_amount_per_window, window_seconds),
+        );
+    }
+
+    /// Assigns a rate limit tier to a sender. Admin only.
+    ///
+    /// Emits `("rl_tier",)` with data `(sender, tier)`.
+    pub fn set_sender_tier(
+        env: Env,
+        admin: Address,
+        sender: Address,
+        tier: rate_limit::RateLimitTier,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::RateLimitTier(sender.clone()), &tier);
+        env.events().publish((symbol_short!("rl_tier"),), sender);
+    }
+
+    /// Like `tip`, but enforces rate limits before processing.
+    ///
+    /// Panics with `RateLimitTipCount`, `RateLimitAmount`, or `RateLimitInterval`
+    /// when the sender has exceeded their tier's limits.
+    /// Emits `("rl_vio",)` on violation (before panicking) and `("tip", creator)`
+    /// on success.
+    pub fn tip_rate_limited(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        // Enforce rate limits if enabled.
+        let rl_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateLimitEnabled)
+            .unwrap_or(true);
+        if rl_enabled {
+            match rate_limit::check_limits(&env, &sender, amount) {
+                Ok(()) => {}
+                Err(rate_limit::Violation::Interval) => {
+                    env.events().publish((symbol_short!("rl_vio"),), (sender.clone(), 0u32));
+                    panic_with_error!(&env, TipJarError::RateLimitInterval);
+                }
+                Err(rate_limit::Violation::TipCount) => {
+                    env.events().publish((symbol_short!("rl_vio"),), (sender.clone(), 1u32));
+                    panic_with_error!(&env, TipJarError::RateLimitTipCount);
+                }
+                Err(rate_limit::Violation::Amount) => {
+                    env.events().publish((symbol_short!("rl_vio"),), (sender.clone(), 2u32));
+                    panic_with_error!(&env, TipJarError::RateLimitAmount);
+                }
+            }
+        }
+
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee: i128 = (amount * fee_bp as i128) / 10_000;
+        let creator_amount = amount - fee;
+
+        if fee > 0 {
+            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let current_fee: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
+            env.storage().instance().set(&fee_key, &(current_fee + fee));
+        }
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        env.storage().persistent().set(&bal_key, &(existing_bal + creator_amount));
+
+        let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
+        let existing_tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+        env.storage().persistent().set(&tot_key, &(existing_tot + creator_amount));
+
+        let tip_id: u64 = env.storage().instance().get(&DataKey::TipCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TipCounter, &(tip_id + 1));
+
+        Self::update_leaderboard_stats(&env, &sender, &creator, creator_amount);
+        Self::track_creator_token(&env, &creator, &token);
+
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+
+        // Record the tip for rate limiting after successful transfer.
+        if rl_enabled {
+            rate_limit::record_tip(&env, &sender, amount);
+        }
+
+        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, creator_amount));
+        tip_id
+    }
+
+    /// Returns the current rate limit state for `sender`.
+    pub fn get_rate_limit_state(env: Env, sender: Address) -> rate_limit::RateLimitState {
+        rate_limit::get_state(&env, &sender)
+    }
+
+    /// Returns the rate limit config for a tier.
+    pub fn get_rate_limit_config(env: Env, tier: rate_limit::RateLimitTier) -> rate_limit::RateLimitConfig {
+        rate_limit::get_config(&env, &tier)
+    }
+
+    /// Returns the rate limit tier assigned to `sender`.
+    pub fn get_sender_rate_limit_tier(env: Env, sender: Address) -> rate_limit::RateLimitTier {
+        rate_limit::get_sender_tier(&env, &sender)
+    }
+
+    /// Returns whether rate limiting is currently enabled.
+    pub fn is_rate_limit_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::RateLimitEnabled)
+            .unwrap_or(true)
     }
 }
