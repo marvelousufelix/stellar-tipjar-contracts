@@ -43,6 +43,9 @@ pub mod dispute;
 // Privacy features
 pub mod privacy_tip;
 
+// Options trading
+pub mod options;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -645,6 +648,30 @@ pub enum DataKey {
     InsAdmin,
     /// List of claim IDs for a creator per token.
     InsClms(Address, Address),
+    /// Option contract by ID.
+    Option(u64),
+    /// Option counter for ID generation.
+    OptionCounter,
+    /// Options written by address.
+    WrittenOptions(Address),
+    /// Options held by address.
+    HeldOptions(Address),
+    /// Option position tracking for address.
+    OptionPosition(Address),
+    /// Option pricing parameters.
+    OptionPricingParams,
+    /// Active options list.
+    ActiveOptions,
+    /// Collateral locked per token per address for options.
+    OptionCollateral(Address, Address),
+    /// Bridge relayer address.
+    BridgeRelayer,
+    /// Bridge token address.
+    BridgeToken,
+    /// Bridge enabled flag.
+    BridgeEnabled,
+    /// Bridge fee in basis points.
+    BridgeFeeBps,
 }
 
 #[contracterror]
@@ -801,6 +828,28 @@ pub enum TipJarError {
     InvalidReservePrice = 85,
     /// Auction has already ended and can no longer accept bids.
     AuctionEnded = 86,
+    /// Option not found.
+    OptionNotFound = 87,
+    /// Option is not active.
+    OptionNotActive = 88,
+    /// Option has expired.
+    OptionExpired = 89,
+    /// Option is out of the money.
+    OptionOutOfMoney = 90,
+    /// Not the option holder.
+    NotOptionHolder = 91,
+    /// Not the option writer.
+    NotOptionWriter = 92,
+    /// Option already has a holder.
+    OptionAlreadySold = 93,
+    /// Insufficient collateral for option.
+    InsufficientCollateral = 94,
+    /// Invalid option parameters.
+    InvalidOptionParams = 95,
+    /// Option has not expired yet.
+    OptionNotExpired = 96,
+    /// Invalid bridge fee.
+    InvalidBridgeFee = 97,
 }
 
 #[contract]
@@ -5192,5 +5241,376 @@ impl TipJarContract {
             .get(&DataKey::BridgeEnabled)
             .unwrap_or(false)
     }
-}
 
+    // ── options trading ──────────────────────────────────────────────────────
+
+    /// Initialize options trading system with default pricing parameters.
+    ///
+    /// Admin only. Emits `("opt_init",)`.
+    pub fn init_options_trading(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let params = options::PricingParams {
+            volatility_bps: options::DEFAULT_VOLATILITY_BPS,
+            risk_free_rate_bps: options::DEFAULT_RISK_FREE_RATE_BPS,
+            min_premium_bps: options::DEFAULT_MIN_PREMIUM_BPS,
+            max_premium_bps: options::DEFAULT_MAX_PREMIUM_BPS,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::OptionPricingParams, &params);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::OptionCounter, &0u64);
+
+        env.events().publish((symbol_short!("opt_init"),), ());
+    }
+
+    /// Write (create) a new option contract.
+    ///
+    /// Writer must provide collateral which is locked until expiration or exercise.
+    /// Returns the option ID.
+    /// Emits `("opt_write",)` with data `(option_id, writer, option_type, strike_price, amount, expiration)`.
+    pub fn write_option(
+        env: Env,
+        writer: Address,
+        option_type: options::OptionType,
+        token: Address,
+        strike_price: i128,
+        amount: i128,
+        expiration: u64,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        writer.require_auth();
+
+        // Validate inputs
+        if strike_price <= 0 || amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidOptionParams);
+        }
+
+        let now = env.ledger().timestamp();
+        if expiration <= now {
+            panic_with_error!(&env, TipJarError::InvalidOptionParams);
+        }
+
+        // Check token is whitelisted
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        // Calculate required collateral
+        let collateral = options::calculate_collateral(option_type, strike_price, amount);
+
+        // Generate option ID
+        let option_id: u64 = env.storage().instance().get(&DataKey::OptionCounter).unwrap_or(0);
+        env.storage().instance().set(&DataKey::OptionCounter, &(option_id + 1));
+
+        // Create option contract
+        let option = options::OptionContract {
+            option_id,
+            option_type,
+            writer: writer.clone(),
+            holder: None,
+            token: token.clone(),
+            strike_price,
+            premium: 0,
+            amount,
+            expiration,
+            created_at: now,
+            status: options::OptionStatus::Active,
+            collateral,
+        };
+
+        // Lock collateral
+        token::Client::new(&env, &token).transfer(
+            &writer,
+            &env.current_contract_address(),
+            &collateral,
+        );
+
+        // Update storage
+        env.storage()
+            .persistent()
+            .set(&DataKey::Option(option_id), &option);
+        
+        options::add_written_option(&env, &writer, option_id);
+        options::add_active_option(&env, option_id);
+
+        // Update writer position
+        let mut position = options::get_position(&env, &writer);
+        position.written_count += 1;
+        position.total_collateral += collateral;
+        options::update_position(&env, &position);
+
+        // Update locked collateral tracking
+        let current_locked = options::get_locked_collateral(&env, &writer, &token);
+        options::update_locked_collateral(&env, &writer, &token, current_locked + collateral);
+
+        env.events().publish(
+            (symbol_short!("opt_wrt"),),
+            (option_id, writer, option_type, strike_price, amount, expiration),
+        );
+
+        option_id
+    }
+
+    /// Buy an option by paying the premium to the writer.
+    ///
+    /// Premium is calculated based on current pricing parameters.
+    /// Emits `("opt_buy",)` with data `(option_id, buyer, premium)`.
+    pub fn buy_option(
+        env: Env,
+        buyer: Address,
+        option_id: u64,
+        spot_price: i128,
+    ) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        // Get option
+        let mut option: options::OptionContract = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Option(option_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::OptionNotFound));
+
+        // Verify option is available
+        if option.holder.is_some() {
+            panic_with_error!(&env, TipJarError::OptionAlreadySold);
+        }
+
+        if option.status != options::OptionStatus::Active {
+            panic_with_error!(&env, TipJarError::OptionNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= option.expiration {
+            panic_with_error!(&env, TipJarError::OptionExpired);
+        }
+
+        // Calculate premium
+        let params = options::get_pricing_params(&env);
+        let time_to_expiry = option.expiration.saturating_sub(now);
+        let premium = options::pricing::calculate_premium(
+            &env,
+            option.option_type,
+            spot_price,
+            option.strike_price,
+            option.amount,
+            time_to_expiry,
+            &params,
+        );
+
+        // Transfer premium from buyer to writer
+        token::Client::new(&env, &option.token).transfer(
+            &buyer,
+            &option.writer,
+            &premium,
+        );
+
+        // Update option
+        option.holder = Some(buyer.clone());
+        option.premium = premium;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Option(option_id), &option);
+
+        // Update positions
+        let mut writer_position = options::get_position(&env, &option.writer);
+        writer_position.premiums_earned += premium;
+        options::update_position(&env, &writer_position);
+
+        let mut buyer_position = options::get_position(&env, &buyer);
+        buyer_position.held_count += 1;
+        buyer_position.premiums_paid += premium;
+        options::update_position(&env, &buyer_position);
+
+        // Add to buyer's held options
+        options::add_held_option(&env, &buyer, option_id);
+
+        env.events().publish(
+            (symbol_short!("opt_buy"),),
+            (option_id, buyer, premium),
+        );
+    }
+
+    /// Exercise an option contract.
+    ///
+    /// Only the holder can exercise. Option must be in the money.
+    /// Returns the payoff amount.
+    /// Emits `("opt_exer",)` with data `(option_id, holder, payoff)`.
+    pub fn exercise_option(
+        env: Env,
+        holder: Address,
+        option_id: u64,
+        spot_price: i128,
+    ) -> i128 {
+        Self::require_not_paused(&env);
+        holder.require_auth();
+
+        let payoff = options::exercise::exercise_option(&env, &holder, option_id, spot_price);
+
+        env.events().publish(
+            (symbol_short!("opt_exer"),),
+            (option_id, holder, payoff),
+        );
+
+        payoff
+    }
+
+    /// Expire an option that has passed its expiration time.
+    ///
+    /// Returns collateral to writer. Can be called by anyone.
+    /// Emits `("opt_exp",)` with data `option_id`.
+    pub fn expire_option(env: Env, option_id: u64) {
+        options::exercise::expire_option(&env, option_id);
+
+        env.events().publish(
+            (symbol_short!("opt_exp"),),
+            option_id,
+        );
+    }
+
+    /// Cancel an unsold option (writer only).
+    ///
+    /// Returns collateral to writer. Only works if option has no holder yet.
+    /// Emits `("opt_canc",)` with data `option_id`.
+    pub fn cancel_option(env: Env, writer: Address, option_id: u64) {
+        Self::require_not_paused(&env);
+        writer.require_auth();
+
+        options::exercise::cancel_option(&env, &writer, option_id);
+
+        env.events().publish(
+            (symbol_short!("opt_canc"),),
+            option_id,
+        );
+    }
+
+    /// Get option contract details by ID.
+    pub fn get_option(env: Env, option_id: u64) -> Option<options::OptionContract> {
+        options::get_option(&env, option_id)
+    }
+
+    /// Get all options written by an address.
+    pub fn get_written_options(env: Env, writer: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WrittenOptions(writer))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get all options held by an address.
+    pub fn get_held_options(env: Env, holder: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HeldOptions(holder))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get position summary for an address.
+    pub fn get_option_position(env: Env, address: Address) -> options::OptionPosition {
+        options::get_position(&env, &address)
+    }
+
+    /// Get all active options.
+    pub fn get_active_options(env: Env) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveOptions)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Calculate option premium for given parameters.
+    ///
+    /// Useful for price discovery before writing an option.
+    pub fn calculate_option_premium(
+        env: Env,
+        option_type: options::OptionType,
+        spot_price: i128,
+        strike_price: i128,
+        amount: i128,
+        time_to_expiry: u64,
+    ) -> i128 {
+        let params = options::get_pricing_params(&env);
+        options::pricing::calculate_premium(
+            &env,
+            option_type,
+            spot_price,
+            strike_price,
+            amount,
+            time_to_expiry,
+            &params,
+        )
+    }
+
+    /// Update option pricing parameters (admin only).
+    ///
+    /// Emits `("opt_prm",)` with data `params`.
+    pub fn update_option_pricing(
+        env: Env,
+        admin: Address,
+        params: options::PricingParams,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        options::update_pricing_params(&env, &params);
+
+        env.events().publish(
+            (symbol_short!("opt_prm"),),
+            params,
+        );
+    }
+
+    /// Get current option pricing parameters.
+    pub fn get_option_pricing_params(env: Env) -> options::PricingParams {
+        options::get_pricing_params(&env)
+    }
+
+    /// Batch expire multiple options.
+    ///
+    /// Useful for cleaning up expired options. Returns count of expired options.
+    /// Emits `("opt_bexp",)` with data `expired_count`.
+    pub fn batch_expire_options(env: Env, option_ids: Vec<u64>) -> u32 {
+        let mut ids_vec: soroban_sdk::vec::Vec<u64> = soroban_sdk::vec::Vec::new(&env);
+        for i in 0..option_ids.len() {
+            ids_vec.push_back(option_ids.get(i).unwrap());
+        }
+        
+        let mut expired_count = 0u32;
+        for i in 0..ids_vec.len() {
+            let option_id = ids_vec.get(i).unwrap();
+            if let Some(option) = options::get_option(&env, option_id) {
+                if option.status == options::OptionStatus::Active {
+                    let now = env.ledger().timestamp();
+                    if now >= option.expiration {
+                        options::exercise::expire_option(&env, option_id);
+                        expired_count += 1;
+                    }
+                }
+            }
+        }
+
+        env.events().publish(
+            (symbol_short!("opt_bexp"),),
+            expired_count,
+        );
+
+        expired_count
+    }
+}

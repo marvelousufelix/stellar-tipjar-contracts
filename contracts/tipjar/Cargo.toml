@@ -49,4 +49,7 @@ path = "tests/withdrawal_limits_tests.rs"
 name = "multisig_withdrawal_tests"
 path = "tests/multisig_withdrawal_tests.rs"
 
+[[test]]
+name = "options_trading_tests"
+path = "tests/options_trading_tests.rs"
 
