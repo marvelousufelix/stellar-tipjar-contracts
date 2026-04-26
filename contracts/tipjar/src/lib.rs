@@ -7,6 +7,7 @@ pub mod integrations;
 pub mod security;
 pub mod bridge;
 pub mod privacy;
+pub mod synthetic;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
@@ -475,13 +476,43 @@ pub enum LeaderboardType {
     TopCreators,
 }
 
-/// Immutable snapshot of key contract state for migration / audit purposes.
+/// State snapshot keyed by snapshot_id.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateSnapshot {
     pub snapshot_id: u64,
     pub timestamp: u64,
     pub metadata: soroban_sdk::String,
+}
+
+/// Circuit breaker configuration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerConfig {
+    /// Maximum amount for a single tip before triggering breaker.
+    pub max_single_tip: i128,
+    /// Maximum total volume in a sliding window before triggering breaker.
+    pub max_volume_window: i128,
+    /// Window duration in seconds.
+    pub window_seconds: u64,
+    /// Cooldown duration in seconds when halted.
+    pub cooldown_seconds: u64,
+    /// Whether the circuit breaker is active.
+    pub enabled: bool,
+}
+
+/// Current state of the circuit breaker.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerState {
+    /// Start time of the current volume window.
+    pub window_start: u64,
+    /// Total volume processed in the current window.
+    pub current_volume: i128,
+    /// Timestamp until which the contract is halted (0 if not halted).
+    pub halted_until: u64,
+    /// Number of times the breaker has been triggered.
+    pub trigger_count: u32,
 }
 
 /// Storage layout for persistent contract data.
@@ -672,6 +703,20 @@ pub enum DataKey {
     BridgeEnabled,
     /// Bridge fee in basis points.
     BridgeFeeBps,
+    /// Synthetic asset record by asset ID.
+    SyntheticAsset(u64),
+    /// Global counter for synthetic asset IDs.
+    SyntheticAssetCounter,
+    /// List of synthetic asset IDs for a creator.
+    CreatorSyntheticAssets(Address),
+    /// Locked collateral amount per creator per token for synthetic assets.
+    SyntheticCollateral(Address, Address), // (creator, token)
+    /// Synthetic token balance per holder per asset.
+    SyntheticBalance(Address, u64), // (holder, asset_id)
+    /// Circuit breaker configuration.
+    CircuitBreakerConfig,
+    /// Circuit breaker current state.
+    CircuitBreakerState,
 }
 
 #[contracterror]
@@ -850,6 +895,22 @@ pub enum TipJarError {
     OptionNotExpired = 96,
     /// Invalid bridge fee.
     InvalidBridgeFee = 97,
+    /// Synthetic asset not found.
+    SyntheticAssetNotFound = 98,
+    /// Synthetic asset is inactive/paused.
+    SyntheticAssetInactive = 99,
+    /// Invalid collateralization ratio (must be 10000-50000 bps).
+    InvalidCollateralizationRatio = 100,
+    /// Collateralization ratio violation.
+    CollateralizationViolation = 101,
+    /// Token not in creator's tip pool.
+    TokenNotInPool = 102,
+    /// Insufficient pool balance for redemption.
+    InsufficientPoolBalance = 103,
+    /// Circuit breaker has halted operations.
+    CircuitBreakerHalted = 104,
+    /// Circuit breaker configuration is invalid.
+    InvalidCircuitBreakerConfig = 105,
 }
 
 #[contract]
@@ -868,6 +929,89 @@ impl TipJarContract {
         {
             panic_with_error!(env, TipJarError::ContractPaused);
         }
+
+        if let Some(state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreakerState)
+        {
+            if state.halted_until > env.ledger().timestamp() {
+                panic_with_error!(env, TipJarError::CircuitBreakerHalted);
+            }
+        }
+    }
+
+    fn check_circuit_breaker(env: &Env, amount: i128) {
+        let config = env
+            .storage()
+            .instance()
+            .get::<DataKey, CircuitBreakerConfig>(&DataKey::CircuitBreakerConfig)
+            .unwrap_or(CircuitBreakerConfig {
+                max_single_tip: 1_000_000_000_000_000, // 100M tokens
+                max_volume_window: 5_000_000_000_000_000, // 500M tokens
+                window_seconds: 3600, // 1 hour
+                cooldown_seconds: 1800, // 30 mins
+                enabled: false,
+            });
+
+        if !config.enabled {
+            return;
+        }
+
+        let mut state = env
+            .storage()
+            .instance()
+            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreakerState)
+            .unwrap_or(CircuitBreakerState {
+                window_start: env.ledger().timestamp(),
+                current_volume: 0,
+                halted_until: 0,
+                trigger_count: 0,
+            });
+
+        let now = env.ledger().timestamp();
+
+        // 1. Check for individual tip spike
+        if amount > config.max_single_tip {
+            Self::trigger_breaker(env, &mut state, &config, symbol_short!("spike"));
+            return;
+        }
+
+        // 2. Check for volume spike in window
+        if now >= state.window_start.saturating_add(config.window_seconds) {
+            // New window
+            state.window_start = now;
+            state.current_volume = amount;
+        } else {
+            state.current_volume = state.current_volume.saturating_add(amount);
+            if state.current_volume > config.max_volume_window {
+                Self::trigger_breaker(env, &mut state, &config, symbol_short!("volume"));
+                return;
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerState, &state);
+    }
+
+    fn trigger_breaker(
+        env: &Env,
+        state: &mut CircuitBreakerState,
+        config: &CircuitBreakerConfig,
+        reason: soroban_sdk::Symbol,
+    ) {
+        let now = env.ledger().timestamp();
+        state.halted_until = now.saturating_add(config.cooldown_seconds);
+        state.trigger_count = state.trigger_count.saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerState, state);
+
+        env.events().publish(
+            (symbol_short!("cb_trig"), reason),
+            (state.halted_until, state.trigger_count),
+        );
     }
 
     fn add_creator_auction(env: &Env, creator: &Address, auction_id: u64) {
@@ -1028,6 +1172,65 @@ impl TipJarContract {
             .instance()
             .get::<DataKey, bool>(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Sets the circuit breaker configuration. Admin only.
+    pub fn set_circuit_breaker_config(env: Env, admin: Address, config: CircuitBreakerConfig) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if config.window_seconds == 0 || config.cooldown_seconds == 0 {
+            panic_with_error!(&env, TipJarError::InvalidCircuitBreakerConfig);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerConfig, &config);
+        env.events()
+            .publish((symbol_short!("cb_cfg"),), config);
+    }
+
+    /// Returns the current circuit breaker configuration.
+    pub fn get_circuit_breaker_config(env: Env) -> Option<CircuitBreakerConfig> {
+        env.storage().instance().get(&DataKey::CircuitBreakerConfig)
+    }
+
+    /// Returns the current circuit breaker state.
+    pub fn get_circuit_breaker_state(env: Env) -> Option<CircuitBreakerState> {
+        env.storage().instance().get(&DataKey::CircuitBreakerState)
+    }
+
+    /// Manually triggers the circuit breaker. Admin only.
+    pub fn trigger_circuit_breaker(env: Env, admin: Address, reason: soroban_sdk::Symbol) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let config = env
+            .storage()
+            .instance()
+            .get::<DataKey, CircuitBreakerConfig>(&DataKey::CircuitBreakerConfig)
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, TipJarError::InvalidCircuitBreakerConfig)
+            });
+
+        let mut state = env
+            .storage()
+            .instance()
+            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreakerState)
+            .unwrap_or(CircuitBreakerState {
+                window_start: env.ledger().timestamp(),
+                current_volume: 0,
+                halted_until: 0,
+                trigger_count: 0,
+            });
+
+        Self::trigger_breaker(&env, &mut state, &config, reason);
     }
 
     /// Transfers `amount` of `token` from `sender` into escrow for `creator`.
@@ -5612,5 +5815,233 @@ impl TipJarContract {
         );
 
         expired_count
+    }
+
+    // ── Synthetic Assets ─────────────────────────────────────────────────────
+
+    /// Creates a new synthetic asset backed by a creator's tip pool.
+    ///
+    /// # Parameters
+    /// - `creator`: Creator address whose tip pool backs the asset
+    /// - `backing_token`: Token address for collateral
+    /// - `collateralization_ratio`: Ratio in basis points (10000-50000)
+    ///
+    /// # Returns
+    /// - New asset identifier
+    pub fn create_synthetic_asset(
+        env: Env,
+        creator: Address,
+        backing_token: Address,
+        collateralization_ratio: u32,
+    ) -> u64 {
+        creator.require_auth();
+        Self::require_not_paused(&env);
+        
+        synthetic::admin::create_synthetic_asset(
+            &env,
+            &creator,
+            &backing_token,
+            collateralization_ratio,
+        ).unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Mints synthetic tokens by providing collateral.
+    ///
+    /// # Parameters
+    /// - `user`: Address requesting to mint tokens
+    /// - `asset_id`: Identifier of the synthetic asset
+    /// - `amount`: Amount of synthetic tokens to mint
+    ///
+    /// # Returns
+    /// - Amount of collateral required and transferred
+    pub fn mint_synthetic_tokens(
+        env: Env,
+        user: Address,
+        asset_id: u64,
+        amount: i128,
+    ) -> i128 {
+        user.require_auth();
+        Self::require_not_paused(&env);
+        
+        synthetic::minting::mint(&env, &user, asset_id, amount)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Redeems synthetic tokens for underlying value.
+    ///
+    /// # Parameters
+    /// - `holder`: Address redeeming tokens
+    /// - `asset_id`: Identifier of the synthetic asset
+    /// - `amount`: Amount of synthetic tokens to redeem
+    ///
+    /// # Returns
+    /// - Redemption value transferred to holder
+    pub fn redeem_synthetic_tokens(
+        env: Env,
+        holder: Address,
+        asset_id: u64,
+        amount: i128,
+    ) -> i128 {
+        holder.require_auth();
+        
+        synthetic::redemption::redeem(&env, &holder, asset_id, amount)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Pauses a synthetic asset (prevents new minting).
+    ///
+    /// # Parameters
+    /// - `creator`: Creator address (must match asset creator)
+    /// - `asset_id`: Identifier of the synthetic asset
+    pub fn pause_synthetic_asset(env: Env, creator: Address, asset_id: u64) {
+        creator.require_auth();
+        
+        synthetic::admin::pause_synthetic_asset(&env, &creator, asset_id)
+            .unwrap_or_else(|e| panic_with_error!(&env, e));
+    }
+
+    /// Resumes a paused synthetic asset.
+    ///
+    /// # Parameters
+    /// - `creator`: Creator address (must match asset creator)
+    /// - `asset_id`: Identifier of the synthetic asset
+    pub fn resume_synthetic_asset(env: Env, creator: Address, asset_id: u64) {
+        creator.require_auth();
+        
+        synthetic::admin::resume_synthetic_asset(&env, &creator, asset_id)
+            .unwrap_or_else(|e| panic_with_error!(&env, e));
+    }
+
+    /// Updates collateralization ratio for future minting.
+    ///
+    /// # Parameters
+    /// - `creator`: Creator address (must match asset creator)
+    /// - `asset_id`: Identifier of the synthetic asset
+    /// - `new_ratio`: New ratio in basis points (10000-50000)
+    pub fn update_collateralization_ratio(
+        env: Env,
+        creator: Address,
+        asset_id: u64,
+        new_ratio: u32,
+    ) {
+        creator.require_auth();
+        
+        synthetic::admin::update_collateralization_ratio(&env, &creator, asset_id, new_ratio)
+            .unwrap_or_else(|e| panic_with_error!(&env, e));
+    }
+
+    /// Adds collateral to improve collateralization ratio.
+    ///
+    /// # Parameters
+    /// - `creator`: Creator address
+    /// - `asset_id`: Identifier of the synthetic asset
+    /// - `amount`: Amount of collateral to add
+    pub fn add_synthetic_collateral(
+        env: Env,
+        creator: Address,
+        asset_id: u64,
+        amount: i128,
+    ) {
+        creator.require_auth();
+        
+        synthetic::admin::add_collateral(&env, &creator, asset_id, amount)
+            .unwrap_or_else(|e| panic_with_error!(&env, e));
+    }
+
+    /// Retrieves synthetic asset details by asset identifier.
+    ///
+    /// # Parameters
+    /// - `asset_id`: Identifier of the synthetic asset
+    ///
+    /// # Returns
+    /// - Complete synthetic asset record
+    pub fn get_synthetic_asset(env: Env, asset_id: u64) -> synthetic::SyntheticAsset {
+        synthetic::queries::get_synthetic_asset(&env, asset_id)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Retrieves all synthetic assets for a creator.
+    ///
+    /// # Parameters
+    /// - `creator`: Creator address
+    ///
+    /// # Returns
+    /// - Vector of asset identifiers for the creator
+    pub fn get_creator_synthetic_assets(env: Env, creator: Address) -> Vec<u64> {
+        synthetic::queries::get_creator_synthetic_assets(&env, &creator)
+    }
+
+    /// Retrieves the current oracle price for a synthetic asset.
+    ///
+    /// # Parameters
+    /// - `asset_id`: Identifier of the synthetic asset
+    ///
+    /// # Returns
+    /// - Current oracle price
+    pub fn get_synthetic_oracle_price(env: Env, asset_id: u64) -> i128 {
+        synthetic::queries::get_synthetic_oracle_price(&env, asset_id)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Retrieves the total supply for a synthetic asset.
+    ///
+    /// # Parameters
+    /// - `asset_id`: Identifier of the synthetic asset
+    ///
+    /// # Returns
+    /// - Total supply of synthetic tokens
+    pub fn get_synthetic_total_supply(env: Env, asset_id: u64) -> i128 {
+        synthetic::queries::get_synthetic_total_supply(&env, asset_id)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Retrieves the collateralization ratio for a synthetic asset.
+    ///
+    /// # Parameters
+    /// - `asset_id`: Identifier of the synthetic asset
+    ///
+    /// # Returns
+    /// - Current collateralization ratio in basis points
+    pub fn get_synthetic_collateralization_ratio(env: Env, asset_id: u64) -> u32 {
+        synthetic::queries::get_synthetic_collateralization_ratio(&env, asset_id)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Calculates the required collateral for a minting amount.
+    ///
+    /// # Parameters
+    /// - `asset_id`: Identifier of the synthetic asset
+    /// - `amount`: Amount of synthetic tokens to mint
+    ///
+    /// # Returns
+    /// - Required collateral amount
+    pub fn calculate_required_collateral(env: Env, asset_id: u64, amount: i128) -> i128 {
+        synthetic::queries::calculate_synthetic_required_collateral(&env, asset_id, amount)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Calculates the redemption value for a token amount.
+    ///
+    /// # Parameters
+    /// - `asset_id`: Identifier of the synthetic asset
+    /// - `amount`: Amount of synthetic tokens
+    ///
+    /// # Returns
+    /// - Redemption value in backing tokens
+    pub fn calculate_redemption_value(env: Env, asset_id: u64, amount: i128) -> i128 {
+        synthetic::queries::calculate_synthetic_redemption_value(&env, asset_id, amount)
+            .unwrap_or_else(|e| panic_with_error!(&env, e))
+    }
+
+    /// Retrieves synthetic token balance for holder and asset.
+    ///
+    /// # Parameters
+    /// - `asset_id`: Identifier of the synthetic asset
+    /// - `holder`: Address of the token holder
+    ///
+    /// # Returns
+    /// - Balance of synthetic tokens (0 if no balance exists)
+    pub fn get_synthetic_holder_balance(env: Env, asset_id: u64, holder: Address) -> i128 {
+        synthetic::queries::get_holder_balance(&env, asset_id, &holder)
     }
 }
