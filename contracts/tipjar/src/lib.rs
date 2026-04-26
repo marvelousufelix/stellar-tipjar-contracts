@@ -52,6 +52,9 @@ pub mod index_fund;
 // Bonding curves
 pub mod bonding_curve;
 
+// TWAP oracle
+pub mod twap_oracle;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4308,6 +4311,108 @@ impl TipJarContract {
     /// Returns a bonding curve's full configuration and state.
     pub fn bc_get_curve(env: Env, curve_id: u64) -> bonding_curve::BondingCurve {
         bonding_curve::get_curve_info(&env, curve_id)
+    }
+
+    // ── TWAP oracle ───────────────────────────────────────────────────────────
+
+    /// Creates a new TWAP oracle for manipulation-resistant price feeds.
+    ///
+    /// * `updater`          — address authorised to push price updates.
+    /// * `window_seconds`   — default TWAP window in seconds (60 – 604 800).
+    /// * `max_observations` — ring-buffer capacity (2 – 256).
+    /// * `initial_price`    — seed price × PRICE_PRECISION (must be > 0).
+    ///
+    /// Returns the new oracle ID.
+    /// Emits `("twap_new",)` with `(oracle_id, base_token, quote_token, initial_price)`.
+    pub fn twap_create_oracle(
+        env: Env,
+        creator: Address,
+        updater: Address,
+        base_token: Address,
+        quote_token: Address,
+        window_seconds: u64,
+        max_observations: u32,
+        initial_price: i128,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        twap_oracle::create_oracle(
+            &env,
+            &creator,
+            &updater,
+            &base_token,
+            &quote_token,
+            window_seconds,
+            max_observations,
+            initial_price,
+        )
+    }
+
+    /// Records a new price observation into the oracle's ring buffer.
+    ///
+    /// Only the oracle's designated `updater` address may call this.
+    /// Emits `("twap_upd",)` with `(oracle_id, price, timestamp, accumulator)`.
+    pub fn twap_record_price(env: Env, updater: Address, oracle_id: u64, price: i128) {
+        Self::require_not_paused(&env);
+        twap_oracle::record_price(&env, &updater, oracle_id, price);
+    }
+
+    /// Returns the TWAP over the oracle's configured default window.
+    ///
+    /// Uses cumulative price accumulators: `TWAP = Δaccumulator / Δtime`.
+    /// Falls back to the latest spot price if fewer than 2 observations exist.
+    pub fn twap_get_twap(env: Env, oracle_id: u64) -> twap_oracle::TwapResult {
+        twap_oracle::get_twap(&env, oracle_id)
+    }
+
+    /// Returns the TWAP over a custom `window_seconds`.
+    /// Pass `window_seconds = 0` to use the oracle's configured default.
+    pub fn twap_get_twap_window(
+        env: Env,
+        oracle_id: u64,
+        window_seconds: u64,
+    ) -> twap_oracle::TwapResult {
+        twap_oracle::get_twap_with_window(&env, oracle_id, window_seconds)
+    }
+
+    /// Returns the latest spot price for an oracle (not time-weighted).
+    pub fn twap_get_latest_price(env: Env, oracle_id: u64) -> i128 {
+        twap_oracle::get_latest_price(&env, oracle_id)
+    }
+
+    /// Returns up to `limit` most-recent observations for an oracle,
+    /// in chronological order (oldest first).
+    pub fn twap_get_observations(
+        env: Env,
+        oracle_id: u64,
+        limit: u32,
+    ) -> Vec<twap_oracle::Observation> {
+        twap_oracle::get_observations(&env, oracle_id, limit)
+    }
+
+    /// Returns the oracle configuration and live state.
+    pub fn twap_get_oracle(env: Env, oracle_id: u64) -> twap_oracle::TwapOracle {
+        twap_oracle::get_oracle_info(&env, oracle_id)
+    }
+
+    /// Updates the oracle's TWAP window and/or updater address.
+    /// Only the current updater may call this.
+    /// Emits `("twap_cfg",)` with `(oracle_id, new_window_seconds, new_updater)`.
+    pub fn twap_update_config(
+        env: Env,
+        updater: Address,
+        oracle_id: u64,
+        new_window_seconds: u64,
+        new_updater: Address,
+    ) {
+        Self::require_not_paused(&env);
+        twap_oracle::update_config(&env, &updater, oracle_id, new_window_seconds, &new_updater);
+    }
+
+    /// Deactivates a TWAP oracle. Only the updater may call this.
+    /// Emits `("twap_off",)` with `(oracle_id,)`.
+    pub fn twap_deactivate(env: Env, updater: Address, oracle_id: u64) {
+        Self::require_not_paused(&env);
+        twap_oracle::deactivate_oracle(&env, &updater, oracle_id);
     }
 
     /// Checks and awards milestones when a creator reaches specific tip thresholds.
