@@ -672,6 +672,8 @@ pub enum DataKey {
     BridgeEnabled,
     /// Bridge fee in basis points.
     BridgeFeeBps,
+    /// Subscription tier configuration keyed by tier.
+    TierConfig(SubscriptionTier),
 }
 
 #[contracterror]
@@ -850,6 +852,18 @@ pub enum TipJarError {
     OptionNotExpired = 96,
     /// Invalid bridge fee.
     InvalidBridgeFee = 97,
+    /// Vesting duration must be greater than zero.
+    InvalidVestingDuration = 101,
+    /// Cliff duration exceeds vesting duration.
+    CliffExceedsVesting = 102,
+    /// Vesting schedule ID is invalid (zero).
+    InvalidVestingId = 103,
+    /// Vesting schedule not found.
+    VestingScheduleNotFound = 104,
+    /// No vested amount available to withdraw.
+    NoVestedAmount = 105,
+    /// Subscription tier is not configured.
+    TierNotConfigured = 106,
 }
 
 #[contract]
@@ -5612,5 +5626,105 @@ impl TipJarContract {
         );
 
         expired_count
+    }
+
+    // ── staking rewards ──────────────────────────────────────────────────────
+
+    /// Initializes the staking system with the token to be staked.
+    ///
+    /// Admin only. Must be called before any staking operations.
+    /// Emits `("stk_init",)` with data `token`.
+    pub fn init_staking(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        staking::init_staking(&env, &token);
+        env.events().publish((symbol_short!("stk_init"),), token);
+    }
+
+    /// Stakes `amount` of the configured staking token on behalf of `staker`.
+    ///
+    /// Transfers tokens from `staker` into contract escrow and records the
+    /// stake position with the current timestamp for time-weighted rewards.
+    /// Emits `("stake",)` with data `(staker, amount, new_total)`.
+    pub fn stake(env: Env, staker: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        staking::distribution::stake(&env, &staker, amount);
+    }
+
+    /// Claims all pending staking rewards for `staker`.
+    ///
+    /// Calculates time-weighted rewards based on stake duration and pool share,
+    /// transfers them to `staker`, and resets the reward accumulator.
+    /// Returns the claimed amount.
+    /// Emits `("claim",)` with data `(staker, amount)`.
+    pub fn claim_staking_rewards(env: Env, staker: Address) -> i128 {
+        Self::require_not_paused(&env);
+        staking::distribution::claim_rewards(&env, &staker)
+    }
+
+    /// Unstakes `amount` of tokens for `staker` after the cooldown period.
+    ///
+    /// Automatically claims pending rewards before returning the principal.
+    /// Panics if the cooldown period has not elapsed.
+    /// Emits `("unstake",)` with data `(staker, amount, remaining_stake)`.
+    pub fn unstake(env: Env, staker: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        staking::distribution::unstake(&env, &staker, amount);
+    }
+
+    /// Adds `amount` of tokens to the staking reward pool.
+    ///
+    /// Anyone may fund the reward pool. Tokens are transferred from `funder`
+    /// into the contract.
+    /// Emits `("stk_fund",)` with data `(funder, amount)`.
+    pub fn fund_reward_pool(env: Env, funder: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        funder.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let token = staking::get_staked_token(&env);
+        token::Client::new(&env, &token).transfer(&funder, &env.current_contract_address(), &amount);
+        staking::add_rewards(&env, amount);
+        env.events().publish((symbol_short!("stk_fund"),), (funder, amount));
+    }
+
+    /// Returns the pending (unclaimed) rewards for `staker`.
+    pub fn get_pending_staking_rewards(env: Env, staker: Address) -> i128 {
+        staking::distribution::get_pending_rewards(&env, &staker)
+    }
+
+    /// Returns the current staked amount for `staker`.
+    pub fn get_stake_amount(env: Env, staker: Address) -> i128 {
+        staking::distribution::get_stake_amount(&env, &staker)
+    }
+
+    /// Returns the staking configuration.
+    pub fn get_staking_config(env: Env) -> staking::StakingConfig {
+        staking::get_staking_config(&env)
+    }
+
+    /// Returns the stake info for `staker`, if any.
+    pub fn get_stake_info(env: Env, staker: Address) -> Option<staking::StakeInfo> {
+        staking::get_stake_info(&env, &staker)
+    }
+
+    /// Returns whether `staker` can currently unstake (cooldown elapsed).
+    pub fn can_unstake(env: Env, staker: Address) -> bool {
+        staking::distribution::can_unstake(&env, &staker)
+    }
+
+    /// Returns the remaining cooldown seconds before `staker` can unstake.
+    pub fn get_unstake_cooldown_remaining(env: Env, staker: Address) -> u64 {
+        staking::distribution::get_unstake_cooldown_remaining(&env, &staker)
     }
 }
