@@ -46,6 +46,9 @@ pub mod privacy_tip;
 // Options trading
 pub mod options;
 
+// Conditional escrow system
+pub mod escrow;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -672,6 +675,14 @@ pub enum DataKey {
     BridgeEnabled,
     /// Bridge fee in basis points.
     BridgeFeeBps,
+    /// Subscription tier configuration keyed by tier.
+    TierConfig(SubscriptionTier),
+    /// Conditional escrow record keyed by escrow ID.
+    Escrow(u64),
+    /// Global counter for escrow IDs.
+    EscrowCounter,
+    /// List of escrow IDs for a creator.
+    CreatorEscrows(Address),
 }
 
 #[contracterror]
@@ -850,6 +861,28 @@ pub enum TipJarError {
     OptionNotExpired = 96,
     /// Invalid bridge fee.
     InvalidBridgeFee = 97,
+    /// Vesting duration must be greater than zero.
+    InvalidVestingDuration = 101,
+    /// Cliff duration exceeds vesting duration.
+    CliffExceedsVesting = 102,
+    /// Vesting schedule ID is invalid (zero).
+    InvalidVestingId = 103,
+    /// Vesting schedule not found.
+    VestingScheduleNotFound = 104,
+    /// No vested amount available to withdraw.
+    NoVestedAmount = 105,
+    /// Subscription tier is not configured.
+    TierNotConfigured = 106,
+    /// Conditional escrow not found.
+    EscrowNotFound = 107,
+    /// Escrow is not in a pending state.
+    EscrowNotPending = 108,
+    /// Escrow conditions have not been met.
+    EscrowConditionsNotMet = 109,
+    /// Escrow deadline has not passed and conditions are not failing.
+    EscrowCannotRefund = 110,
+    /// Escrow is not in a disputed state.
+    EscrowNotDisputed = 111,
 }
 
 #[contract]
@@ -5612,5 +5645,142 @@ impl TipJarContract {
         );
 
         expired_count
+    }
+
+    // ── conditional escrow ───────────────────────────────────────────────────
+
+    /// Creates a conditional escrow: `sender` deposits `amount` of `token` for
+    /// `creator`, to be released only when all `conditions` evaluate to true.
+    ///
+    /// `deadline` is an optional Unix timestamp after which the sender may
+    /// reclaim funds if conditions have not been met.
+    ///
+    /// Returns the escrow ID.
+    /// Emits `("esc_crt",)` with data `(id, sender, creator, amount)`.
+    pub fn create_escrow(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        conditions: Vec<conditions::types::Condition>,
+        deadline: Option<u64>,
+        description: String,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+        escrow::create_escrow(&env, &sender, &creator, &token, amount, conditions, deadline, description)
+    }
+
+    /// Releases escrow funds to the creator if all conditions pass.
+    ///
+    /// Caller must be the creator or sender.
+    /// Emits `("esc_rel",)` with data `(escrow_id, creator, amount)`.
+    pub fn release_escrow(env: Env, caller: Address, escrow_id: u64) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        let esc: escrow::ConditionalEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::EscrowNotFound));
+        if esc.status != escrow::EscrowStatus::Pending {
+            panic_with_error!(&env, TipJarError::EscrowNotPending);
+        }
+        if !conditions::evaluator::evaluate_all(&env, &esc.conditions) {
+            panic_with_error!(&env, TipJarError::EscrowConditionsNotMet);
+        }
+        escrow::release_escrow(&env, &caller, escrow_id);
+    }
+
+    /// Refunds escrow to sender when deadline has passed or conditions fail.
+    ///
+    /// Only the original sender may call this.
+    /// Emits `("esc_ref",)` with data `(escrow_id, sender, amount)`.
+    pub fn refund_escrow(env: Env, sender: Address, escrow_id: u64) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        let esc: escrow::ConditionalEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::EscrowNotFound));
+        if esc.status != escrow::EscrowStatus::Pending && esc.status != escrow::EscrowStatus::Disputed {
+            panic_with_error!(&env, TipJarError::EscrowNotPending);
+        }
+        let now = env.ledger().timestamp();
+        let deadline_passed = esc.deadline.map(|d| now >= d).unwrap_or(false);
+        let conditions_fail = !conditions::evaluator::evaluate_all(&env, &esc.conditions);
+        if !deadline_passed && !conditions_fail {
+            panic_with_error!(&env, TipJarError::EscrowCannotRefund);
+        }
+        escrow::refund_escrow(&env, &sender, escrow_id);
+    }
+
+    /// Marks an escrow as disputed. Sender or creator may dispute.
+    ///
+    /// Emits `("esc_dis",)` with data `(escrow_id, caller)`.
+    pub fn dispute_escrow(env: Env, caller: Address, escrow_id: u64) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        let esc: escrow::ConditionalEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::EscrowNotFound));
+        if esc.status != escrow::EscrowStatus::Pending {
+            panic_with_error!(&env, TipJarError::EscrowNotPending);
+        }
+        escrow::dispute_escrow(&env, &caller, escrow_id);
+    }
+
+    /// Resolves a disputed escrow. Admin only.
+    ///
+    /// `release_to_creator = true` releases funds to creator; `false` refunds sender.
+    /// Emits `("esc_rsl",)` with data `(escrow_id, recipient, release_to_creator)`.
+    pub fn resolve_escrow_dispute(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        release_to_creator: bool,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        let esc: escrow::ConditionalEscrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::EscrowNotFound));
+        if esc.status != escrow::EscrowStatus::Disputed {
+            panic_with_error!(&env, TipJarError::EscrowNotDisputed);
+        }
+        escrow::resolve_escrow_dispute(&env, escrow_id, release_to_creator);
+    }
+
+    /// Returns the escrow record for `escrow_id`, if it exists.
+    pub fn get_escrow(env: Env, escrow_id: u64) -> Option<escrow::ConditionalEscrow> {
+        env.storage().persistent().get(&DataKey::Escrow(escrow_id))
+    }
+
+    /// Returns all escrow IDs for `creator`.
+    pub fn get_creator_escrows(env: Env, creator: Address) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CreatorEscrows(creator))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
