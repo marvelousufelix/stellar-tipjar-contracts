@@ -14,8 +14,13 @@ use soroban_sdk::{
     token, Address, BytesN, Env, Map, String, Vec,
 };
 
+use circuit_breaker::{
+    EnhancedCircuitBreakerConfig, VolumeThresholds, CooldownConfig, CircuitBreakerError
+};
+
 pub mod upgrade;
 pub mod storage;
+pub mod circuit_breaker;
 
 #[cfg(test)]
 extern crate std;
@@ -515,6 +520,49 @@ pub struct CircuitBreakerState {
     pub trigger_count: u32,
 }
 
+/// Credit configuration for the tipping platform.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreditConfig {
+    /// Maximum credit ratio in basis points of historical total tips (e.g., 2000 = 20%).
+    pub max_credit_ratio_bps: u32,
+    /// Interest rate in basis points per 30-day period (e.g., 100 = 1%).
+    pub interest_rate_bps: u32,
+    /// Minimum historical tips required in a token to be eligible for credit.
+    pub min_total_tips: i128,
+    /// Share of incoming tips automatically diverted for repayment (e.g., 5000 = 50%).
+    pub repayment_share_bps: u32,
+    /// Whether the credit system is enabled.
+    pub enabled: bool,
+}
+
+/// Represents a creator's credit account for a specific token.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreditAccount {
+    /// Outstanding principal amount borrowed.
+    pub principal: i128,
+    /// Interest accrued but not yet paid.
+    pub interest_accrued: i128,
+    /// Ledger timestamp of the last interest accrual or repayment.
+    pub last_update: u64,
+    /// Total amount ever borrowed.
+    pub total_borrowed: i128,
+    /// Total amount ever repaid (principal + interest).
+    pub total_repaid: i128,
+}
+
+/// A record of a credit event (borrowing or repayment).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreditRecord {
+    pub id: u64,
+    pub amount: i128,
+    pub interest_portion: i128,
+    pub timestamp: u64,
+    pub is_repayment: bool,
+}
+
 /// Storage layout for persistent contract data.
 #[derive(Clone)]
 #[contracttype]
@@ -533,190 +581,266 @@ pub enum DataKey {
     Admin,
     /// Messages appended for a creator.
     CreatorMessages(Address),
-    /// Current number of milestones for a creator (used for ID).
-    MilestoneCounter(Address),
-    /// Data for a specific milestone.
-    Milestone(Address, u64),
-    /// Active milestone IDs for a creator to track.
-    ActiveMilestones(Address),
-    /// Maps an address to its assigned Role (persistent).
-    UserRole(Address),
-    /// Maps a Role to the set of addresses holding it (persistent).
-    RoleMembers(Role),
-    /// Aggregate stats for a tipper in a specific time bucket (bucket_id: 0=AllTime, YYYYMM=Monthly, YYYYWW=Weekly).
-    TipperAggregate(Address, u32),
-    /// Aggregate stats for a creator in a specific time bucket.
-    CreatorAggregate(Address, u32),
-    /// Ordered list of all known tipper addresses for a bucket.
-    TipperParticipants(u32),
-    /// Ordered list of all known creator addresses for a bucket.
-    CreatorParticipants(u32),
-    /// Locked tip record keyed by (creator, tip_id).
-    LockedTip(Address, u64),
-    /// Per-creator counter for assigning tip IDs (u64).
-    LockedTipCounter(Address),
-    /// Global matching program counter.
-    MatchingCounter,
-    /// Individual matching program by ID.
-    MatchingProgram(u64),
-    /// Matching program IDs indexed under a creator.
-    CrMatchProgs(Address),
-    /// Individual tip record by global tip ID.
-    TipRecord(u64),
-    /// Global tip counter for assigning tip IDs.
-    TipCounter,
+    /// Milestone related keys.
+    Milestone(MilestoneKey),
+    /// Role related keys.
+    Role(RoleKey),
+    /// Stats related keys.
+    Stats(StatsKey),
+    /// Locked tip related keys.
+    LockedTip(LockedTipKey),
+    /// Matching related keys.
+    Matching(MatchingKey),
+    /// Tip related keys.
+    Tip(TipKey),
     /// Off-chain oracle approval flag keyed by condition ID.
     OffchainCondition(BytesN<32>),
-    /// Most-recently computed dynamic fee in basis points.
-    CurrentFeeBps,
+    /// Dynamic fee related keys.
+    Fee(FeeKey),
     /// Monotonically increasing contract version, incremented on each upgrade.
     ContractVersion,
     /// Subscription keyed by (subscriber, creator).
     Subscription(Address, Address),
     /// Human-readable reason stored when the contract is paused.
     PauseReason,
-    /// TipMetadata keyed by (creator, tip_index).
-    TipHistory(Address, u64),
-    /// Total number of tips with metadata stored for a creator.
-    TipCount(Address),
-    /// Platform fee in basis points (u32).
-    FeeBasisPoints,
-    /// Accumulated platform fee balance per token.
-    PlatformFeeBalance(Address),
     /// Refund window in seconds (u64).
     RefundWindow,
-    /// Leaderboard entries for a given LeaderboardType.
+    /// Leaderboard related keys.
     Leaderboard(LeaderboardType),
     /// Tipper total tips sent (i128).
     TipperTotal(Address),
-    /// State snapshot keyed by snapshot_id.
-    Snapshot(u64),
-    /// Next snapshot ID counter.
-    LatestSnapshot,
-    /// Per-creator withdrawal rate-limit state.
-    WithdrawalLimits(Address),
-    /// Platform-wide default withdrawal limits applied when no per-creator config exists.
-    DefWithdrawLimits,
+    /// Snapshot related keys.
+    Snapshot(SnapshotKey),
+    /// Limit related keys.
+    Limit(LimitKey),
     /// Next time-lock ID counter (u64).
     NextLockId,
     /// List of lock IDs belonging to a creator.
     CreatorLocks(Address),
     /// Active time-lock IDs for expiration processing.
     ActiveTimeLocks,
-    /// Active delegations keyed by (creator, delegate).
-    Delegation(Address, Address),
-    /// List of active delegate addresses for a creator.
-    Delegates(Address),
-    /// Historical delegation snapshots for a creator.
-    DelegationHistory(Address),
-    /// Vesting schedule record keyed by schedule ID.
-    VestingSchedule(u64),
-    /// Vesting schedules for a creator keyed by (creator, schedule_id).
-    CreatorVestingSchedules(Address, u64),
-    /// List of vesting schedule IDs for a creator.
-    CreatorVestingList(Address),
-    /// Global vesting schedule counter.
-    VestingSchedCtr,
-    /// Stream record keyed by stream ID.
-    Stream(u64),
-    /// List of stream IDs for a creator.
-    CreatorStreams(Address),
-    /// List of stream IDs for a sender.
-    SenderStreams(Address),
-    /// Global stream counter.
-    StreamCounter,
-    /// Global auction counter.
-    AuctionCounter,
-    /// Auction record keyed by auction ID.
-    Auction(u64),
-    /// Creator auction IDs list.
-    CreatorAuctions(Address),
+    /// Delegation related keys.
+    Delegation(DelegationKey),
+    /// Vesting related keys.
+    Vesting(VestingKey),
+    /// Stream related keys.
+    Stream(StreamKey),
+    /// Auction related keys.
+    Auction(AuctionKey),
     /// Time-lock record keyed by lock ID.
     TimeLock(u64),
-    /// Multi-sig withdrawal request keyed by request ID.
-    MultiSigRequest(u64),
-    /// Global counter for multi-sig request IDs.
-    MultiSigCounter,
-    /// Multi-sig configuration (threshold, signers, required approvals).
-    MultiSigConfig,
-    /// Dispute record keyed by dispute_id.
-    Dispute(u64),
-    /// Global counter for dispute IDs.
-    DisputeCounter,
-    /// List of dispute IDs for a creator.
-    CreatorDisputes(Address),
-    /// Evidence records keyed by (dispute_id, evidence_index).
-    DisputeEvidence(u64, u64),
-    /// Evidence counter for a dispute.
-    DisputeEvidenceCounter(u64),
-    /// Private tip record keyed by tip_id.
-    PrivateTip(u64),
-    /// Global counter for private tip IDs.
-    PrivateTipCounter,
-    /// Revealed amount for a private tip keyed by tip_id.
-    PrivateTipAmount(u64),
-    /// Insurance pool configuration.
-    InsPoolCfg,
-    /// Insurance pool state per token.
-    InsPoolToken(Address),
-    /// Insurance claim record keyed by claim ID.
-    InsClaim(u64),
-    /// Global counter for insurance claim IDs.
-    InsClaimCtr,
-    /// Creator's insurance contribution per token.
-    InsContrib(Address, Address),
-    /// Creator's last claim timestamp per token.
-    InsLastClm(Address, Address),
-    /// Creator's active claim count per token.
-    InsActiveClms(Address, Address),
-    /// Total number of claims for a creator per token.
-    InsTotalClms(Address, Address),
-    /// Insurance feature enabled flag.
-    InsEnabled,
-    /// Max active claims per creator.
-    InsMaxClms,
-    /// Insurance admin address.
-    InsAdmin,
-    /// List of claim IDs for a creator per token.
-    InsClms(Address, Address),
-    /// Option contract by ID.
-    Option(u64),
-    /// Option counter for ID generation.
-    OptionCounter,
-    /// Options written by address.
-    WrittenOptions(Address),
-    /// Options held by address.
-    HeldOptions(Address),
-    /// Option position tracking for address.
-    OptionPosition(Address),
-    /// Option pricing parameters.
-    OptionPricingParams,
-    /// Active options list.
-    ActiveOptions,
-    /// Collateral locked per token per address for options.
-    OptionCollateral(Address, Address),
-    /// Bridge relayer address.
-    BridgeRelayer,
-    /// Bridge token address.
-    BridgeToken,
-    /// Bridge enabled flag.
-    BridgeEnabled,
-    /// Bridge fee in basis points.
-    BridgeFeeBps,
-    /// Synthetic asset record by asset ID.
-    SyntheticAsset(u64),
-    /// Global counter for synthetic asset IDs.
-    SyntheticAssetCounter,
-    /// List of synthetic asset IDs for a creator.
-    CreatorSyntheticAssets(Address),
-    /// Locked collateral amount per creator per token for synthetic assets.
-    SyntheticCollateral(Address, Address), // (creator, token)
-    /// Synthetic token balance per holder per asset.
-    SyntheticBalance(Address, u64), // (holder, asset_id)
-    /// Circuit breaker configuration.
-    CircuitBreakerConfig,
-    /// Circuit breaker current state.
-    CircuitBreakerState,
+    /// Multi-sig related keys.
+    MultiSig(MultiSigKey),
+    /// Dispute related keys.
+    Dispute(DisputeKey),
+    /// Private tip related keys.
+    PrivateTip(PrivateTipKey),
+    /// Insurance related keys.
+    Insurance(InsuranceKey),
+    /// Option related keys.
+    Option(OptionKey),
+    /// Bridge related keys.
+    Bridge(BridgeKey),
+    /// Synthetic related keys.
+    Synthetic(SyntheticKey),
+    /// Circuit breaker related keys.
+    CircuitBreaker(CircuitBreakerKey),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VestingKey {
+    Schedule(u64),
+    CreatorSchedules(Address, u64),
+    CreatorList(Address),
+    Ctr,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamKey {
+    Record(u64),
+    CreatorStreams(Address),
+    SenderStreams(Address),
+    Ctr,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuctionKey {
+    Ctr,
+    Record(u64),
+    CreatorList(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MultiSigKey {
+    Request(u64),
+    Ctr,
+    Config,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisputeKey {
+    Record(u64),
+    Ctr,
+    CreatorList(Address),
+    Evidence(u64, u64),
+    EvidenceCtr(u64),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PrivateTipKey {
+    Record(u64),
+    Ctr,
+    Amount(u64),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InsuranceKey {
+    Cfg,
+    Token(Address),
+    Claim(u64),
+    Ctr,
+    Contrib(Address, Address),
+    LastClm(Address, Address),
+    ActiveClms(Address, Address),
+    TotalClms(Address, Address),
+    Enabled,
+    MaxClms,
+    Admin,
+    Clms(Address, Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OptionKey {
+    Record(u64),
+    Ctr,
+    Written(Address),
+    Held(Address),
+    Position(Address),
+    PricingParams,
+    Active,
+    Collateral(Address, Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BridgeKey {
+    Relayer,
+    Token,
+    Enabled,
+    FeeBps,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MilestoneKey {
+    Counter(Address),
+    Record(Address, u64),
+    Active(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RoleKey {
+    User(Address),
+    Members(Role),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatsKey {
+    TipperAgg(Address, u32),
+    CreatorAgg(Address, u32),
+    TipperParts(u32),
+    CreatorParts(u32),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LockedTipKey {
+    Record(Address, u64),
+    Ctr(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MatchingKey {
+    Ctr,
+    Program(u64),
+    CreatorProgs(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TipKey {
+    Record(u64),
+    Ctr,
+    History(Address, u64),
+    Count(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FeeKey {
+    BasisPoints,
+    Balance(Address),
+    CurrentDynamic,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotKey {
+    Record(u64),
+    Ctr,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LimitKey {
+    Withdrawal(Address),
+    Default,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DelegationKey {
+    Active(Address, Address),
+    List(Address),
+    History(Address),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyntheticKey {
+    Asset(u64),
+    Ctr,
+    CreatorAssets(Address),
+    Collateral(Address, Address),
+    Balance(Address, u64),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CircuitBreakerKey {
+    /// Legacy configuration (deprecated)
+    Config,
+    /// Legacy state (deprecated)
+    State,
+    /// Legacy cooldown (deprecated)
+    Cooldown(Address),
+    /// Enhanced configuration
+    EnhancedConfig,
+    /// Creator-specific overrides
+    CreatorOverrides(Address),
+    /// Token-specific limits
+    TokenLimits(Address),
 }
 
 #[contracterror]
@@ -733,11 +857,35 @@ pub enum TipJarError {
     InvalidGoalAmount = 8,
     Unauthorized = 9,
     RoleNotFound = 10,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CoreError {
+    AlreadyInitialized = 1,
+    TokenNotWhitelisted = 2,
+    InvalidAmount = 3,
+    NothingToWithdraw = 4,
+    MessageTooLong = 5,
+    MilestoneNotFound = 6,
+    MilestoneAlreadyCompleted = 7,
+    InvalidGoalAmount = 8,
+    Unauthorized = 9,
+    RoleNotFound = 10,
     BatchTooLarge = 11,
     InsufficientBalance = 12,
     InvalidUnlockTime = 13,
     TipStillLocked = 14,
     LockedTipNotFound = 15,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum SystemError {
     MatchProgNotFound = 16,
     MatchProgInactive = 17,
     InvalidMatchRatio = 18,
@@ -745,173 +893,136 @@ pub enum TipJarError {
     NftNotConfigured = 20,
     SwapFailed = 21,
     ConditionFailed = 22,
-    /// Caller is not the stored admin; upgrade rejected.
     UpgradeUnauthorized = 23,
-    /// Subscription does not exist.
     SubscriptionNotFound = 24,
-    /// Subscription is not in Active state.
     SubscriptionNotActive = 25,
-    /// Payment interval has not elapsed yet.
     PaymentNotDue = 26,
-    /// Interval is below the minimum allowed.
     InvalidInterval = 27,
-    /// Recipient count is outside the allowed range (2–10).
     InvalidRecipientCount = 28,
-    /// Basis-point shares do not sum to 10 000.
     InvalidPercentageSum = 29,
-    /// An individual share is zero.
     InvalidPercentage = 30,
-    /// Contract is paused; state-changing operations are blocked.
-    ContractPaused = 31,
-    /// Fee exceeds the maximum allowed (500 bps).
-    FeeExceedsMaximum = 32,
-    /// Time-lock record not found.
-    LockNotFound = 33,
-    /// Unlock time has not been reached yet.
-    NotUnlocked = 34,
-    /// Time-lock has already been cancelled.
-    LockCancelled = 35,
-    /// Cooldown period between withdrawals has not elapsed yet.
-    WithdrawalCooldown = 36,
-    /// Withdrawal would exceed the creator's daily limit.
-    DailyLimitExceeded = 37,
-    /// Multi-sig request not found.
-    MsigReqNotFound = 38,
-    /// Multi-sig request has expired.
-    MultiSigReqExpired = 39,
-    /// Multi-sig request has already been executed or cancelled.
-    MultiSigReqClosed = 40,
-    /// Approver is not in the authorised signer list.
-    NotASigner = 41,
-    /// Approver has already approved this request.
-    AlreadyApproved = 42,
-    /// Multi-sig config has not been set.
-    MultiSigNotConfigured = 43,
-    /// No delegation exists for this creator/delegate pair.
-    DelegationNotFound = 44,
-    /// Delegation has expired.
-    DelegationExpired = 45,
-    /// Delegation has been revoked or deactivated.
-    DelegationInactive = 46,
-    /// Requested delegate withdrawal exceeds allowed limit.
-    DelegationLimitExceeded = 47,
-    /// Delegation duration must be greater than zero.
-    InvalidDuration = 48,
-    /// Dispute not found.
-    DisputeNotFound = 49,
-    /// Dispute is not in Open status.
-    DisputeNotOpen = 50,
-    /// Only initiator or arbitrator can perform this action.
-    DisputeUnauthorized = 51,
-    /// Insurance pool not configured.
-    InsPoolNotCfg = 52,
-    /// Contribution amount below minimum.
-    ContributionTooLow = 53,
-    /// Contribution amount exceeds maximum.
-    ContributionTooHigh = 54,
-    /// No insurance coverage for this creator/token.
-    NoCoverage = 55,
-    /// Claim has not been approved.
-    ClaimNotApproved = 56,
-    /// Claim already paid out.
-    ClaimAlreadyPaid = 57,
-    /// Insufficient reserves in pool.
-    InsufficientReserves = 58,
-    /// Claim cooldown period not elapsed.
-    ClaimCooldownActive = 59,
-    /// Too many active claims for this creator.
-    TooManyActiveClaims = 60,
-    /// Claim not found.
-    ClaimNotFound = 61,
-    /// Already contributed to pool this period.
-    AlreadyContributed = 62,
-    /// Insurance feature is disabled.
-    InsuranceDisabled = 63,
-    /// Previous claim must be resolved first.
-    PendingClaimExists = 64,
-    /// Payout would exceed pool reserves.
-    PayoutExceedsReserves = 65,
-    /// Invalid claim amount.
-    InvalidClaimAmount = 66,
-    /// Admin approval required for claim.
-    AdmAppReq = 67,
-    /// Private tip not found.
-    PrivateTipNotFound = 68,
-    /// Invalid reveal - hash mismatch.
-    InvalidReveal = 69,
-    /// Stream not found.
-    StreamNotFound = 70,
-    /// Stream has already been cancelled.
-    StreamAlreadyCancelled = 71,
-    /// Stream has not started yet.
-    StreamNotStarted = 72,
-    /// Stream has already completed.
-    StreamAlreadyCompleted = 73,
-    /// Invalid stream amount.
-    InvalidStreamAmount = 74,
-    /// Invalid stream rate (amount per second).
-    InvalidStreamRate = 75,
-    /// No streamed amount available to withdraw.
-    NoStreamedAmount = 76,
-    /// Stream rate exceeds maximum allowed (1000 tokens/second).
-    StrmRateMax = 77,
-    /// Auction not found.
-    AuctionNotFound = 78,
-    /// Auction has already been settled.
-    AuctionAlreadySettled = 79,
-    /// Auction is not yet ended.
-    AuctionNotEnded = 80,
-    /// Auction bid did not meet the opening reserve price.
-    AuctionReserveNotMet = 81,
-    /// Auction bid is too low.
-    AuctionBidTooLow = 82,
-    /// Auction creator is not authorized to settle.
-    AuctionUnauthorized = 83,
-    /// Auction duration must be greater than zero.
-    InvalidAuctionDuration = 84,
-    /// Auction reserve price must be non-negative.
-    InvalidReservePrice = 85,
-    /// Auction has already ended and can no longer accept bids.
-    AuctionEnded = 86,
-    /// Option not found.
-    OptionNotFound = 87,
-    /// Option is not active.
-    OptionNotActive = 88,
-    /// Option has expired.
-    OptionExpired = 89,
-    /// Option is out of the money.
-    OptionOutOfMoney = 90,
-    /// Not the option holder.
-    NotOptionHolder = 91,
-    /// Not the option writer.
-    NotOptionWriter = 92,
-    /// Option already has a holder.
-    OptionAlreadySold = 93,
-    /// Insufficient collateral for option.
-    InsufficientCollateral = 94,
-    /// Invalid option parameters.
-    InvalidOptionParams = 95,
-    /// Option has not expired yet.
-    OptionNotExpired = 96,
-    /// Invalid bridge fee.
-    InvalidBridgeFee = 97,
-    /// Synthetic asset not found.
-    SyntheticAssetNotFound = 98,
-    /// Synthetic asset is inactive/paused.
-    SyntheticAssetInactive = 99,
-    /// Invalid collateralization ratio (must be 10000-50000 bps).
-    InvalidCollateralizationRatio = 100,
-    /// Collateralization ratio violation.
-    CollateralizationViolation = 101,
-    /// Token not in creator's tip pool.
-    TokenNotInPool = 102,
-    /// Insufficient pool balance for redemption.
-    InsufficientPoolBalance = 103,
-    /// Circuit breaker has halted operations.
-    CircuitBreakerHalted = 104,
-    /// Circuit breaker configuration is invalid.
-    InvalidCircuitBreakerConfig = 105,
 }
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum FeatureError {
+    ContractPaused = 31,
+    FeeExceedsMaximum = 32,
+    LockNotFound = 33,
+    NotUnlocked = 34,
+    LockCancelled = 35,
+    WithdrawalCooldown = 36,
+    DailyLimitExceeded = 37,
+    MsigReqNotFound = 38,
+    MultiSigReqExpired = 39,
+    MultiSigReqClosed = 40,
+    NotASigner = 41,
+    AlreadyApproved = 42,
+    MultiSigNotConfigured = 43,
+    DelegationNotFound = 44,
+    DelegationExpired = 45,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum VestingError {
+    DelegationInactive = 46,
+    DelegationLimitExceeded = 47,
+    InvalidDuration = 48,
+    DisputeNotFound = 49,
+    DisputeNotOpen = 50,
+    DisputeUnauthorized = 51,
+    InsPoolNotCfg = 52,
+    ContributionTooLow = 53,
+    ContributionTooHigh = 54,
+    NoCoverage = 55,
+    ClaimNotApproved = 56,
+    ClaimAlreadyPaid = 57,
+    InsufficientReserves = 58,
+    ClaimCooldownActive = 59,
+    TooManyActiveClaims = 60,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum StreamError {
+    ClaimNotFound = 61,
+    AlreadyContributed = 62,
+    InsuranceDisabled = 63,
+    PendingClaimExists = 64,
+    PayoutExceedsReserves = 65,
+    InvalidClaimAmount = 66,
+    AdmAppReq = 67,
+    PrivateTipNotFound = 68,
+    InvalidReveal = 69,
+    StreamNotFound = 70,
+    StreamAlreadyCancelled = 71,
+    StreamNotStarted = 72,
+    StreamAlreadyCompleted = 73,
+    InvalidStreamAmount = 74,
+    InvalidStreamRate = 75,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum AuctionError {
+    NoStreamedAmount = 76,
+    StrmRateMax = 77,
+    AuctionNotFound = 78,
+    AuctionAlreadySettled = 79,
+    AuctionNotEnded = 80,
+    AuctionReserveNotMet = 81,
+    AuctionBidTooLow = 82,
+    AuctionUnauthorized = 83,
+    InvalidAuctionDuration = 84,
+    InvalidReservePrice = 85,
+    AuctionEnded = 86,
+    OptionNotFound = 87,
+    OptionNotActive = 88,
+    OptionExpired = 89,
+    OptionOutOfMoney = 90,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CreditError {
+    NotOptionHolder = 91,
+    NotOptionWriter = 92,
+    OptionAlreadySold = 93,
+    InsufficientCollateral = 94,
+    InvalidOptionParams = 95,
+    OptionNotExpired = 96,
+    InvalidBridgeFee = 97,
+    SyntheticAssetNotFound = 98,
+    SyntheticAssetInactive = 99,
+    InvalidCollateralizationRatio = 100,
+    CollateralizationViolation = 101,
+    TokenNotInPool = 102,
+    InsufficientPoolBalance = 103,
+    CircuitBreakerHalted = 104,
+    InvalidCircuitBreakerConfig = 105,
+    // Enhanced circuit breaker errors
+    EnhancedCircuitBreakerError = 106,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum OtherError {
+    CreditDisabled = 107,
+    IneligibleForCredit = 108,
+    CreditLimitExceeded = 109,
+    ActiveLoanExists = 110,
+    InsufficientLendingLiquidity = 111,
+    NoActiveCredit = 112,
+}
+
+
 
 #[contract]
 pub struct TipJarContract;
@@ -927,32 +1038,29 @@ impl TipJarContract {
             .get::<DataKey, bool>(&DataKey::Paused)
             .unwrap_or(false)
         {
-            panic_with_error!(env, TipJarError::ContractPaused);
+            panic_with_error!(env, FeatureError::ContractPaused);
         }
 
         if let Some(state) = env
             .storage()
             .instance()
-            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreakerState)
+            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreaker(CircuitBreakerKey::State))
         {
             if state.halted_until > env.ledger().timestamp() {
-                panic_with_error!(env, TipJarError::CircuitBreakerHalted);
+                panic_with_error!(env, SystemError::CircuitBreakerHalted);
             }
         }
     }
 
     fn check_circuit_breaker(env: &Env, amount: i128) {
-        let config = env
+        let config = match env
             .storage()
             .instance()
-            .get::<DataKey, CircuitBreakerConfig>(&DataKey::CircuitBreakerConfig)
-            .unwrap_or(CircuitBreakerConfig {
-                max_single_tip: 1_000_000_000_000_000, // 100M tokens
-                max_volume_window: 5_000_000_000_000_000, // 500M tokens
-                window_seconds: 3600, // 1 hour
-                cooldown_seconds: 1800, // 30 mins
-                enabled: false,
-            });
+            .get::<DataKey, CircuitBreakerConfig>(&DataKey::CircuitBreaker(CircuitBreakerKey::Cfg))
+        {
+            Some(c) => c,
+            None => return,
+        };
 
         if !config.enabled {
             return;
@@ -961,7 +1069,7 @@ impl TipJarContract {
         let mut state = env
             .storage()
             .instance()
-            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreakerState)
+            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreaker(CircuitBreakerKey::State))
             .unwrap_or(CircuitBreakerState {
                 window_start: env.ledger().timestamp(),
                 current_volume: 0,
@@ -990,9 +1098,7 @@ impl TipJarContract {
             }
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::CircuitBreakerState, &state);
+        Self::update_breaker_state(env, &state);
     }
 
     fn trigger_breaker(
@@ -1004,9 +1110,7 @@ impl TipJarContract {
         let now = env.ledger().timestamp();
         state.halted_until = now.saturating_add(config.cooldown_seconds);
         state.trigger_count = state.trigger_count.saturating_add(1);
-        env.storage()
-            .instance()
-            .set(&DataKey::CircuitBreakerState, state);
+        Self::update_breaker_state(env, state);
 
         env.events().publish(
             (symbol_short!("cb_trig"), reason),
@@ -1014,22 +1118,26 @@ impl TipJarContract {
         );
     }
 
+    fn update_breaker_state(env: &Env, state: &CircuitBreakerState) {
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreaker(CircuitBreakerKey::State), state);
+    }
+
     fn add_creator_auction(env: &Env, creator: &Address, auction_id: u64) {
         let mut auctions: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::CreatorAuctions(creator.clone()))
+            .get(&DataKey::Auction(AuctionKey::CreatorList(creator.clone())))
             .unwrap_or_else(|| Vec::new(env));
-        if !auctions.contains(&auction_id) {
-            auctions.push_back(auction_id);
-            env.storage()
-                .persistent()
-                .set(&DataKey::CreatorAuctions(creator.clone()), &auctions);
-        }
+        auctions.push_back(auction_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(AuctionKey::CreatorList(creator.clone())), &auctions);
     }
 
-    fn get_auction_record(env: &Env, auction_id: u64) -> Option<Auction> {
-        env.storage().persistent().get(&DataKey::Auction(auction_id))
+    fn get_auction_internal(env: &Env, auction_id: u64) -> Option<Auction> {
+        env.storage().persistent().get(&DataKey::Auction(AuctionKey::Record(auction_id)))
     }
 
     // ── leaderboard helpers ──────────────────────────────────────────────────
@@ -1053,8 +1161,8 @@ impl TipJarContract {
         kind: ParticipantKind,
     ) {
         let agg_key = match kind {
-            ParticipantKind::Tipper => DataKey::TipperAggregate(addr.clone(), bucket),
-            ParticipantKind::Creator => DataKey::CreatorAggregate(addr.clone(), bucket),
+            ParticipantKind::Tipper => DataKey::Stats(StatsKey::TipperAgg(addr.clone(), bucket)),
+            ParticipantKind::Creator => DataKey::Stats(StatsKey::CreatorAgg(addr.clone(), bucket)),
         };
         let mut entry: LeaderboardEntry = env
             .storage()
@@ -1070,8 +1178,8 @@ impl TipJarContract {
         env.storage().persistent().set(&agg_key, &entry);
 
         let part_key = match kind {
-            ParticipantKind::Tipper => DataKey::TipperParticipants(bucket),
-            ParticipantKind::Creator => DataKey::CreatorParticipants(bucket),
+            ParticipantKind::Tipper => DataKey::Stats(StatsKey::TipperParts(bucket)),
+            ParticipantKind::Creator => DataKey::Stats(StatsKey::CreatorParts(bucket)),
         };
         let mut participants: Vec<Address> = env
             .storage()
@@ -1084,6 +1192,136 @@ impl TipJarContract {
         }
     }
 
+    fn accrue_interest(env: &Env, account: &mut CreditAccount, config: &CreditConfig) {
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(account.last_update);
+        if elapsed == 0 || account.principal == 0 {
+            return;
+        }
+
+        // Rate is per 30 days (2,592,000 seconds)
+        let interest = (account.principal * config.interest_rate_bps as i128 * elapsed as i128)
+            / (10_000 * 30 * 24 * 3600);
+        account.interest_accrued = account.interest_accrued.saturating_add(interest);
+        account.last_update = now;
+    }
+
+    fn process_repayment(
+        env: &Env,
+        creator: &Address,
+        token: &Address,
+        amount_to_credit: i128,
+    ) -> i128 {
+        let config = env
+            .storage()
+            .instance()
+            .get::<soroban_sdk::Symbol, CreditConfig>(&symbol_short!("cr_cfg"));
+        if config.is_none() || !config.as_ref().unwrap().enabled {
+            return amount_to_credit;
+        }
+        let config = config.unwrap();
+
+        let mut account = match env
+            .storage()
+            .persistent()
+            .get::<soroban_sdk::Vec<soroban_sdk::Val>, CreditAccount>(&(symbol_short!("cr_acc"), creator.clone(), token.clone()).into_val(env))
+        {
+            Some(acc) => acc,
+            None => return amount_to_credit,
+        };
+
+        if account.principal == 0 && account.interest_accrued == 0 {
+            return amount_to_credit;
+        }
+
+        Self::accrue_interest(env, &mut account, &config);
+
+        let repayment_share = (amount_to_credit * config.repayment_share_bps as i128) / 10_000;
+        let total_debt = account.principal + account.interest_accrued;
+        let actual_repayment = if repayment_share > total_debt {
+            total_debt
+        } else {
+            repayment_share
+        };
+
+        if actual_repayment == 0 {
+            return amount_to_credit;
+        }
+
+        let mut interest_paid = 0;
+        if actual_repayment <= account.interest_accrued {
+            account.interest_accrued -= actual_repayment;
+            interest_paid = actual_repayment;
+        } else {
+            interest_paid = account.interest_accrued;
+            let principal_paid = actual_repayment - interest_paid;
+            account.interest_accrued = 0;
+            account.principal -= principal_paid;
+        }
+
+        account.total_repaid += actual_repayment;
+        account.last_update = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("cr_acc"), creator.clone(), token.clone()).into_val(env), &account);
+
+        // Repayment goes back to PlatformFeeBalance
+        let fee_key = DataKey::Fee(FeeKey::Balance(token.clone()));
+        let platform_bal: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&fee_key, &(platform_bal + actual_repayment));
+
+        Self::record_credit_event(
+            env,
+            creator,
+            token,
+            actual_repayment,
+            interest_paid,
+            true,
+        );
+
+        env.events().publish(
+            (symbol_short!("repay_au"), creator.clone()),
+            (actual_repayment, token.clone()),
+        );
+
+        amount_to_credit - actual_repayment
+    }
+
+    fn record_credit_event(
+        env: &Env,
+        creator: &Address,
+        token: &Address,
+        amount: i128,
+        interest_portion: i128,
+        is_repayment: bool,
+    ) {
+        let count_key = symbol_short!("cr_ctr");
+        let id: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
+        env.storage().instance().set(&count_key, &(id + 1));
+
+        let record = CreditRecord {
+            id,
+            amount,
+            interest_portion,
+            timestamp: env.ledger().timestamp(),
+            is_repayment,
+        };
+
+        let history_key = (symbol_short!("cr_hst"), creator.clone(), token.clone()).into_val(env);
+        let mut history: Vec<CreditRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(env));
+        if history.len() >= 50 {
+            history.remove(0);
+        }
+        history.push_back(record);
+        env.storage().persistent().set(&history_key, &history);
+    }
+
     // ── initialization ───────────────────────────────────────────────────────
 
     /// One-time setup to choose the administrator for the TipJar.
@@ -1092,7 +1330,7 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::FeeBasisPoints, &0u32);
+        env.storage().instance().set(&DataKey::Fee(FeeKey::BasisPoints), &0u32);
         env.storage().instance().set(&DataKey::RefundWindow, &0u64);
     }
 
@@ -1181,26 +1419,19 @@ impl TipJarContract {
         if admin != stored_admin {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
-
-        if config.window_seconds == 0 || config.cooldown_seconds == 0 {
-            panic_with_error!(&env, TipJarError::InvalidCircuitBreakerConfig);
-        }
-
         env.storage()
             .instance()
-            .set(&DataKey::CircuitBreakerConfig, &config);
-        env.events()
-            .publish((symbol_short!("cb_cfg"),), config);
+            .set(&DataKey::CircuitBreaker(CircuitBreakerKey::Cfg), &config);
     }
 
     /// Returns the current circuit breaker configuration.
     pub fn get_circuit_breaker_config(env: Env) -> Option<CircuitBreakerConfig> {
-        env.storage().instance().get(&DataKey::CircuitBreakerConfig)
+        env.storage().instance().get(&DataKey::CircuitBreaker(CircuitBreakerKey::Cfg))
     }
 
     /// Returns the current circuit breaker state.
     pub fn get_circuit_breaker_state(env: Env) -> Option<CircuitBreakerState> {
-        env.storage().instance().get(&DataKey::CircuitBreakerState)
+        env.storage().instance().get(&DataKey::CircuitBreaker(CircuitBreakerKey::State))
     }
 
     /// Manually triggers the circuit breaker. Admin only.
@@ -1214,15 +1445,13 @@ impl TipJarContract {
         let config = env
             .storage()
             .instance()
-            .get::<DataKey, CircuitBreakerConfig>(&DataKey::CircuitBreakerConfig)
-            .unwrap_or_else(|| {
-                panic_with_error!(&env, TipJarError::InvalidCircuitBreakerConfig)
-            });
+            .get::<DataKey, CircuitBreakerConfig>(&DataKey::CircuitBreaker(CircuitBreakerKey::Cfg))
+            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::CircuitBreakerNotConfigured));
 
         let mut state = env
             .storage()
             .instance()
-            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreakerState)
+            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreaker(CircuitBreakerKey::State))
             .unwrap_or(CircuitBreakerState {
                 window_start: env.ledger().timestamp(),
                 current_volume: 0,
@@ -1233,12 +1462,406 @@ impl TipJarContract {
         Self::trigger_breaker(&env, &mut state, &config, reason);
     }
 
+    /// Resets the circuit breaker state, clearing any active halts. Admin only.
+    pub fn reset_circuit_breaker(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if let Some(mut state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, CircuitBreakerState>(&DataKey::CircuitBreaker(CircuitBreakerKey::State))
+        {
+            state.halted_until = 0;
+            state.current_volume = 0;
+            state.window_start = env.ledger().timestamp();
+            Self::update_breaker_state(&env, &state);
+            env.events().publish((symbol_short!("cb_reset"),), admin);
+        }
+    }
+
+    // ── Enhanced Circuit Breaker Functions ──────────────────────────────────
+
+    /// Sets the enhanced circuit breaker configuration. Admin only.
+    /// 
+    /// Validates all configuration parameters before storing.
+    /// Emits `("enhanced_cb_config",)` with data `admin`.
+    pub fn set_enhanced_cb_config(
+        env: Env, 
+        admin: Address, 
+        config: EnhancedCircuitBreakerConfig
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        // Validate configuration before storing
+        if let Err(_) = config.validate() {
+            panic_with_error!(&env, CreditError::EnhancedCircuitBreakerError);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreaker(CircuitBreakerKey::EnhancedConfig), &config);
+
+        env.events().publish((symbol_short!("cb_cfg"),), admin);
+    }
+
+    /// Returns the current enhanced circuit breaker configuration.
+    pub fn get_enhanced_cb_config(env: Env) -> Option<EnhancedCircuitBreakerConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreaker(CircuitBreakerKey::EnhancedConfig))
+    }
+
+    /// Initializes enhanced circuit breaker with default configuration. Admin only.
+    /// 
+    /// Creates default configuration if not already present.
+    /// Emits `("enhanced_cb_init",)` with data `admin`.
+    pub fn init_enhanced_cb(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        // Only initialize if not already configured
+        if env.storage()
+            .instance()
+            .has(&DataKey::CircuitBreaker(CircuitBreakerKey::EnhancedConfig)) {
+            return;
+        }
+
+        let default_config = EnhancedCircuitBreakerConfig::default_config();
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreaker(CircuitBreakerKey::EnhancedConfig), &default_config);
+
+        env.events().publish((symbol_short!("cb_init"),), admin);
+    }
+
+    /// Sets creator-specific circuit breaker limits. Admin only.
+    /// 
+    /// Stores creator-specific limits separately from main configuration.
+    /// Emits `("creator_cb_limit",)` with data `(creator, limit)`.
+    pub fn set_creator_cb_limit(
+        env: Env,
+        admin: Address,
+        creator: Address,
+        limit: i128,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if limit <= 0 {
+            panic_with_error!(&env, CreditError::EnhancedCircuitBreakerError);
+        }
+
+        // Store creator-specific limit separately
+        env.storage()
+            .persistent()
+            .set(&DataKey::CircuitBreaker(CircuitBreakerKey::CreatorOverrides(creator.clone())), &limit);
+
+        env.events().publish(
+            (symbol_short!("cr_cb_lmt"),), 
+            (creator, limit)
+        );
+    }
+
+    /// Removes creator-specific circuit breaker limits. Admin only.
+    /// 
+    /// Reverts creator to using global limits.
+    /// Emits `("creator_cb_remove",)` with data `creator`.
+    pub fn remove_creator_cb_limit(env: Env, admin: Address, creator: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CircuitBreaker(CircuitBreakerKey::CreatorOverrides(creator.clone())));
+
+        env.events().publish((symbol_short!("cr_cb_rmv"),), creator);
+    }
+
+    /// Sets token-specific circuit breaker limits. Admin only.
+    /// 
+    /// Stores token-specific limits separately from main configuration.
+    /// Emits `("token_cb_limit",)` with data `(token, limit)`.
+    pub fn set_token_circuit_breaker_limit(
+        env: Env,
+        admin: Address,
+        token: Address,
+        limit: i128,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if limit <= 0 {
+            panic_with_error!(&env, CreditError::EnhancedCircuitBreakerError);
+        }
+
+        // Store token-specific limit separately
+        env.storage()
+            .persistent()
+            .set(&DataKey::CircuitBreaker(CircuitBreakerKey::TokenLimits(token.clone())), &limit);
+
+        env.events().publish(
+            (symbol_short!("tk_cb_lmt"),), 
+            (token, limit)
+        );
+    }
+
+    /// Removes token-specific circuit breaker limits. Admin only.
+    /// 
+    /// Reverts token to using global limits.
+    /// Emits `("token_cb_remove",)` with data `token`.
+    pub fn remove_token_circuit_breaker_limit(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CircuitBreaker(CircuitBreakerKey::TokenLimits(token.clone())));
+
+        env.events().publish((symbol_short!("tk_cb_rmv"),), token);
+    }
+
+    /// Sets the credit system configuration. Admin only.
+    pub fn set_credit_config(env: Env, admin: Address, config: CreditConfig) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage().instance().set(&symbol_short!("cr_cfg"), &config);
+    }
+
+    /// Returns the current credit system configuration.
+    pub fn get_credit_config(env: Env) -> Option<CreditConfig> {
+        env.storage().instance().get(&symbol_short!("cr_cfg"))
+    }
+
+    /// Computes the current credit limit for a creator/token pair.
+    pub fn get_credit_limit(env: Env, creator: Address, token: Address) -> i128 {
+        let config = env
+            .storage()
+            .instance()
+            .get::<soroban_sdk::Symbol, CreditConfig>(&symbol_short!("cr_cfg"));
+        let Some(config) = config else {
+            return 0;
+        };
+        if !config.enabled {
+            return 0;
+        }
+
+        let total_tips = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::CreatorTotal(creator, token))
+            .unwrap_or(0);
+        if total_tips < config.min_total_tips {
+            return 0;
+        }
+        (total_tips * config.max_credit_ratio_bps as i128) / 10_000
+    }
+
+    /// Borrow against future tips. Creator only.
+    pub fn borrow(env: Env, creator: Address, token: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let config = env
+            .storage()
+            .instance()
+            .get::<soroban_sdk::Symbol, CreditConfig>(&symbol_short!("cr_cfg"))
+            .unwrap_or_else(|| panic_with_error!(&env, OtherError::CreditDisabled));
+
+        if !config.enabled {
+            panic_with_error!(&env, OtherError::CreditDisabled);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let total_tips = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::CreatorTotal(creator.clone(), token.clone()))
+            .unwrap_or(0);
+        if total_tips < config.min_total_tips {
+            panic_with_error!(&env, OtherError::IneligibleForCredit);
+        }
+
+        let limit = (total_tips * config.max_credit_ratio_bps as i128) / 10_000;
+
+        let mut account = env
+            .storage()
+            .persistent()
+            .get::<soroban_sdk::Vec<soroban_sdk::Val>, CreditAccount>(&(symbol_short!("cr_acc"), creator.clone(), token.clone()).into_val(&env))
+            .unwrap_or(CreditAccount {
+                principal: 0,
+                interest_accrued: 0,
+                last_update: env.ledger().timestamp(),
+                total_borrowed: 0,
+                total_repaid: 0,
+            });
+
+        Self::accrue_interest(&env, &mut account, &config);
+
+        if account.principal + account.interest_accrued + amount > limit {
+            panic_with_error!(&env, OtherError::CreditLimitExceeded);
+        }
+
+        // Check lending liquidity from platform fees
+        let fee_key = DataKey::Fee(FeeKey::Balance(token.clone()));
+        let platform_bal: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
+        if platform_bal < amount {
+            panic_with_error!(&env, OtherError::InsufficientLendingLiquidity);
+        }
+
+        // Deduct from platform balance
+        env.storage()
+            .instance()
+            .set(&fee_key, &(platform_bal - amount));
+
+        // Credit creator balance
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let current_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&bal_key, &(current_bal + amount));
+
+        // Update credit account
+        account.principal += amount;
+        account.total_borrowed += amount;
+        account.last_update = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("cr_acc"), creator.clone(), token.clone()).into_val(&env), &account);
+
+        Self::record_credit_event(&env, &creator, &token, amount, 0, false);
+
+        env.events()
+            .publish((symbol_short!("borrow"), creator), (amount, token));
+    }
+
+    /// Manually repay outstanding credit. Creator only.
+    pub fn repay_credit(env: Env, creator: Address, token: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let mut account = env
+            .storage()
+            .persistent()
+            .get::<soroban_sdk::Vec<soroban_sdk::Val>, CreditAccount>(&(symbol_short!("cr_acc"), creator.clone(), token.clone()).into_val(&env))
+            .unwrap_or_else(|| panic_with_error!(&env, OtherError::NoActiveCredit));
+
+        let config = env
+            .storage()
+            .instance()
+            .get::<soroban_sdk::Symbol, CreditConfig>(&symbol_short!("cr_cfg"))
+            .unwrap();
+        Self::accrue_interest(&env, &mut account, &config);
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        if bal < amount {
+            panic_with_error!(&env, TipJarError::InsufficientBalance);
+        }
+
+        let total_debt = account.principal + account.interest_accrued;
+        let actual_repayment = if amount > total_debt {
+            total_debt
+        } else {
+            amount
+        };
+
+        if actual_repayment == 0 {
+            return;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&bal_key, &(bal - actual_repayment));
+
+        let mut interest_paid = 0;
+        if actual_repayment <= account.interest_accrued {
+            account.interest_accrued -= actual_repayment;
+            interest_paid = actual_repayment;
+        } else {
+            interest_paid = account.interest_accrued;
+            let principal_paid = actual_repayment - interest_paid;
+            account.interest_accrued = 0;
+            account.principal -= principal_paid;
+        }
+
+        account.total_repaid += actual_repayment;
+        account.last_update = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("cr_acc"), creator.clone(), token.clone()).into_val(&env), &account);
+
+        let fee_key = DataKey::Fee(FeeKey::Balance(token.clone()));
+        let platform_bal: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&fee_key, &(platform_bal + actual_repayment));
+
+        Self::record_credit_event(
+            &env,
+            &creator,
+            &token,
+            actual_repayment,
+            interest_paid,
+            true,
+        );
+
+        env.events()
+            .publish((symbol_short!("repay"), creator), (actual_repayment, token));
+    }
+
+    /// Returns the credit account for a creator.
+    pub fn get_credit_account(env: Env, creator: Address, token: Address) -> Option<CreditAccount> {
+        env.storage()
+            .persistent()
+            .get(&(symbol_short!("cr_acc"), creator, token).into_val(&env))
+    }
+
+    /// Returns the credit history for a creator.
+    pub fn get_credit_history(env: Env, creator: Address, token: Address) -> Vec<CreditRecord> {
+        env.storage()
+            .persistent()
+            .get(&(symbol_short!("cr_hst"), creator, token).into_val(&env))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Transfers `amount` of `token` from `sender` into escrow for `creator`.
     ///
     /// Deducts the platform fee before crediting the creator. Returns the tip ID.
     /// Emits `("tip", creator)` with data `(sender, amount)`.
     pub fn tip(env: Env, sender: Address, creator: Address, token: Address, amount: i128) -> u64 {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -1252,14 +1875,14 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
         }
 
-        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::Fee(FeeKey::BasisPoints)).unwrap_or(0);
         let fee: i128 = (amount * fee_bp as i128) / 10_000;
 
         // --- Insurance Premium Calculation ---
-        let ins_enabled: bool = env.storage().instance().get(&DataKey::InsEnabled).unwrap_or(true);
+        let ins_enabled: bool = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Enabled)).unwrap_or(true);
         let mut ins_premium: i128 = 0;
         if ins_enabled {
-            if let Some(config) = env.storage().instance().get::<DataKey, InsurancePoolConfig>(&DataKey::InsPoolCfg) {
+            if let Some(config) = env.storage().instance().get::<DataKey, InsurancePoolConfig>(&DataKey::Insurance(InsuranceKey::Cfg)) {
                 ins_premium = (amount * config.tip_premium_bps as i128) / 10_000;
             }
         }
@@ -1268,7 +1891,7 @@ impl TipJarContract {
 
         // ── state updates before external call (CEI pattern) ─────────────────
         if fee > 0 {
-            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let fee_key = DataKey::Fee(FeeKey::Balance(token.clone()));
             let current_fee: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
             let new_fee_bal: i128 = current_fee
                 .checked_add(fee)
@@ -1277,7 +1900,7 @@ impl TipJarContract {
         }
 
         if ins_premium > 0 {
-            let pool_key = DataKey::InsPoolToken(token.clone());
+            let pool_key = DataKey::Insurance(InsuranceKey::Token(token.clone()));
             let mut pool: InsurancePool = env
                 .storage()
                 .persistent()
@@ -1297,7 +1920,8 @@ impl TipJarContract {
 
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
         let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
-        let new_bal: i128 = existing_bal.checked_add(creator_amount).expect("balance overflow");
+        let net_amount = Self::process_repayment(&env, &creator, &token, creator_amount);
+        let new_bal: i128 = existing_bal.checked_add(net_amount).expect("balance overflow");
         env.storage().persistent().set(&bal_key, &new_bal);
 
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
@@ -1305,8 +1929,8 @@ impl TipJarContract {
         let new_tot: i128 = existing_tot.checked_add(creator_amount).expect("total overflow");
         env.storage().persistent().set(&tot_key, &new_tot);
 
-        let tip_id: u64 = env.storage().instance().get(&DataKey::TipCounter).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TipCounter, &(tip_id + 1));
+        let tip_id: u64 = env.storage().instance().get(&DataKey::Tip(TipKey::Ctr)).unwrap_or(0);
+        env.storage().instance().set(&DataKey::Tip(TipKey::Ctr), &(tip_id + 1));
 
         Self::update_leaderboard_stats(&env, &sender, &creator, creator_amount);
 
@@ -1319,7 +1943,10 @@ impl TipJarContract {
         // ── external call last ───────────────────────────────────────────────
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
 
-        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, creator_amount));
+        env.events().publish(
+            (symbol_short!("tip"), creator.clone()),
+            (sender, creator_amount),
+        );
         tip_id
     }
 
@@ -1356,10 +1983,10 @@ impl TipJarContract {
         Self::require_not_paused(&env);
         creator.require_auth();
         if reserve_price < 0 {
-            panic_with_error!(&env, TipJarError::InvalidReservePrice);
+            panic_with_error!(&env, AuctionError::InvalidReservePrice);
         }
         if duration_seconds == 0 {
-            panic_with_error!(&env, TipJarError::InvalidAuctionDuration);
+            panic_with_error!(&env, AuctionError::InvalidAuctionDuration);
         }
 
         let whitelisted: bool = env
@@ -1371,8 +1998,8 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
         }
 
-        let auction_id: u64 = env.storage().instance().get(&DataKey::AuctionCounter).unwrap_or(0);
-        env.storage().instance().set(&DataKey::AuctionCounter, &(auction_id + 1));
+        let auction_id: u64 = env.storage().instance().get(&DataKey::Auction(AuctionKey::Ctr)).unwrap_or(0);
+        env.storage().instance().set(&DataKey::Auction(AuctionKey::Ctr), &(auction_id + 1));
 
         let now = env.ledger().timestamp();
         let ends_at = now.saturating_add(duration_seconds);
@@ -1388,7 +2015,7 @@ impl TipJarContract {
             settled: false,
         };
 
-        env.storage().persistent().set(&DataKey::Auction(auction_id), &auction);
+        env.storage().persistent().set(&DataKey::Auction(AuctionKey::Record(auction_id)), &auction);
         Self::add_creator_auction(&env, &creator, auction_id);
 
         env.events().publish(
@@ -1405,6 +2032,7 @@ impl TipJarContract {
     /// Emits `("auction_bid",)` with data `(auction_id, bidder, amount)`.
     pub fn place_bid(env: Env, bidder: Address, auction_id: u64, amount: i128) {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         bidder.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -1413,22 +2041,22 @@ impl TipJarContract {
         let mut auction: Auction = env
             .storage()
             .persistent()
-            .get(&DataKey::Auction(auction_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::AuctionNotFound));
+            .get::<DataKey, Auction>(&DataKey::Auction(AuctionKey::Record(auction_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, AuctionError::AuctionNotFound));
         if auction.settled {
-            panic_with_error!(&env, TipJarError::AuctionAlreadySettled);
+            panic_with_error!(&env, AuctionError::AuctionAlreadySettled);
         }
 
         let now = env.ledger().timestamp();
         if now >= auction.ends_at {
-            panic_with_error!(&env, TipJarError::AuctionEnded);
+            panic_with_error!(&env, AuctionError::AuctionEnded);
         }
 
         if amount <= auction.highest_bid {
-            panic_with_error!(&env, TipJarError::AuctionBidTooLow);
+            panic_with_error!(&env, AuctionError::AuctionBidTooLow);
         }
         if auction.highest_bid == 0 && amount < auction.reserve_price {
-            panic_with_error!(&env, TipJarError::AuctionReserveNotMet);
+            panic_with_error!(&env, AuctionError::AuctionReserveNotMet);
         }
 
         let previous_highest_bid = auction.highest_bid;
@@ -1436,7 +2064,7 @@ impl TipJarContract {
 
         auction.highest_bid = amount;
         auction.highest_bidder = Some(bidder.clone());
-        env.storage().persistent().set(&DataKey::Auction(auction_id), &auction);
+        env.storage().persistent().set(&DataKey::Auction(AuctionKey::Record(auction_id)), &auction);
 
         token::Client::new(&env, &auction.token).transfer(
             &bidder,
@@ -1469,22 +2097,22 @@ impl TipJarContract {
         let mut auction: Auction = env
             .storage()
             .persistent()
-            .get(&DataKey::Auction(auction_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::AuctionNotFound));
+            .get::<DataKey, Auction>(&DataKey::Auction(AuctionKey::Record(auction_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, AuctionError::AuctionNotFound));
         if auction.creator != creator {
-            panic_with_error!(&env, TipJarError::AuctionUnauthorized);
+            panic_with_error!(&env, AuctionError::AuctionUnauthorized);
         }
         if auction.settled {
-            panic_with_error!(&env, TipJarError::AuctionAlreadySettled);
+            panic_with_error!(&env, AuctionError::AuctionAlreadySettled);
         }
 
         let now = env.ledger().timestamp();
         if now < auction.ends_at {
-            panic_with_error!(&env, TipJarError::AuctionNotEnded);
+            panic_with_error!(&env, AuctionError::AuctionNotEnded);
         }
 
         auction.settled = true;
-        env.storage().persistent().set(&DataKey::Auction(auction_id), &auction);
+        env.storage().persistent().set(&DataKey::Auction(AuctionKey::Record(auction_id)), &auction);
 
         if auction.highest_bid == 0 || auction.highest_bid < auction.reserve_price {
             if let Some(winner) = auction.highest_bidder {
@@ -1501,15 +2129,15 @@ impl TipJarContract {
             return;
         }
 
-        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::Fee(FeeKey::BasisPoints)).unwrap_or(0);
         let fee: i128 = (auction.highest_bid * fee_bp as i128) / 10_000;
         let mut ins_premium: i128 = 0;
-        let ins_enabled: bool = env.storage().instance().get(&DataKey::InsEnabled).unwrap_or(true);
+        let ins_enabled: bool = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Enabled)).unwrap_or(true);
         if ins_enabled {
             if let Some(config) = env
                 .storage()
                 .instance()
-                .get::<DataKey, InsurancePoolConfig>(&DataKey::InsPoolCfg)
+                .get::<DataKey, InsurancePoolConfig>(&DataKey::Insurance(InsuranceKey::Cfg))
             {
                 ins_premium = (auction.highest_bid * config.tip_premium_bps as i128) / 10_000;
             }
@@ -1521,14 +2149,14 @@ impl TipJarContract {
             .unwrap_or(0);
 
         if fee > 0 {
-            let fee_key = DataKey::PlatformFeeBalance(auction.token.clone());
+            let fee_key = DataKey::Fee(FeeKey::Balance(auction.token.clone()));
             let current_fee: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
             let new_fee_bal = current_fee.checked_add(fee).expect("fee overflow");
             env.storage().instance().set(&fee_key, &new_fee_bal);
         }
 
         if ins_premium > 0 {
-            let pool_key = DataKey::InsPoolToken(auction.token.clone());
+            let pool_key = DataKey::Insurance(InsuranceKey::Token(auction.token.clone()));
             let mut pool: InsurancePool = env
                 .storage()
                 .persistent()
@@ -1552,8 +2180,9 @@ impl TipJarContract {
         if creator_amount > 0 {
             let bal_key = DataKey::CreatorBalance(creator.clone(), auction.token.clone());
             let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+            let net_amount = Self::process_repayment(&env, &creator, &auction.token, creator_amount);
             let new_bal = existing_bal
-                .checked_add(creator_amount)
+                .checked_add(net_amount)
                 .expect("balance overflow");
             env.storage().persistent().set(&bal_key, &new_bal);
 
@@ -1579,14 +2208,14 @@ impl TipJarContract {
 
     /// Returns auction details by ID.
     pub fn get_auction(env: Env, auction_id: u64) -> Option<Auction> {
-        env.storage().persistent().get(&DataKey::Auction(auction_id))
+        env.storage().persistent().get(&DataKey::Auction(AuctionKey::Record(auction_id)))
     }
 
     /// Returns the auction IDs created by a given creator.
     pub fn get_creator_auctions(env: Env, creator: Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::CreatorAuctions(creator))
+            .get(&DataKey::Auction(AuctionKey::CreatorList(creator)))
             .unwrap_or_else(|| Vec::new(env))
     }
 
@@ -1607,7 +2236,7 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::InvalidAmount);
         }
         if duration == 0 {
-            panic_with_error!(&env, TipJarError::InvalidDuration);
+            panic_with_error!(&env, FeatureError::InvalidDuration);
         }
 
         let now = env.ledger().timestamp();
@@ -1623,7 +2252,7 @@ impl TipJarContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+            .set(&DataKey::Delegation(DelegationKey::Active(creator.clone(), delegate.clone())), &delegation);
         Self::add_delegate(&env, &creator, &delegate);
         Self::append_delegation_history(&env, &creator, &delegation);
 
@@ -1653,24 +2282,24 @@ impl TipJarContract {
         let mut delegation: Delegation = env
             .storage()
             .persistent()
-            .get(&DataKey::Delegation(creator.clone(), delegate.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DelegationNotFound));
+            .get(&DataKey::Delegation(DelegationKey::Active(creator.clone(), delegate.clone())))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::DelegationNotFound));
 
         if !delegation.active {
-            panic_with_error!(&env, TipJarError::DelegationInactive);
+            panic_with_error!(&env, FeatureError::DelegationInactive);
         }
         let now = env.ledger().timestamp();
         if now > delegation.expires_at {
             delegation.active = false;
             env.storage()
                 .persistent()
-                .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+                .set(&DataKey::Delegation(DelegationKey::Active(creator.clone(), delegate.clone())), &delegation);
             Self::remove_delegate(&env, &creator, &delegate);
             Self::append_delegation_history(&env, &creator, &delegation);
-            panic_with_error!(&env, TipJarError::DelegationExpired);
+            panic_with_error!(&env, FeatureError::DelegationExpired);
         }
         if delegation.used_amount.checked_add(amount).unwrap_or(i128::MAX) > delegation.max_amount {
-            panic_with_error!(&env, TipJarError::DelegationLimitExceeded);
+            panic_with_error!(&env, FeatureError::DelegationLimitExceeded);
         }
 
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
@@ -1689,7 +2318,7 @@ impl TipJarContract {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+            .set(&DataKey::Delegation(DelegationKey::Active(creator.clone(), delegate.clone())), &delegation);
         Self::append_delegation_history(&env, &creator, &delegation);
 
         token::Client::new(&env, &token).transfer(
@@ -1713,17 +2342,17 @@ impl TipJarContract {
         let mut delegation: Delegation = env
             .storage()
             .persistent()
-            .get(&DataKey::Delegation(creator.clone(), delegate.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DelegationNotFound));
+            .get(&DataKey::Delegation(DelegationKey::Active(creator.clone(), delegate.clone())))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::DelegationNotFound));
 
         if !delegation.active {
-            panic_with_error!(&env, TipJarError::DelegationInactive);
+            panic_with_error!(&env, FeatureError::DelegationInactive);
         }
 
         delegation.active = false;
         env.storage()
             .persistent()
-            .set(&DataKey::Delegation(creator.clone(), delegate.clone()), &delegation);
+            .set(&DataKey::Delegation(DelegationKey::Active(creator.clone(), delegate.clone())), &delegation);
         Self::remove_delegate(&env, &creator, &delegate);
         Self::append_delegation_history(&env, &creator, &delegation);
 
@@ -1741,14 +2370,14 @@ impl TipJarContract {
     ) -> Option<Delegation> {
         env.storage()
             .persistent()
-            .get(&DataKey::Delegation(creator, delegate))
+            .get(&DataKey::Delegation(DelegationKey::Active(creator, delegate)))
     }
 
     /// Returns the active delegate addresses for `creator`.
     pub fn get_delegates(env: Env, creator: Address) -> Vec<Address> {
         env.storage()
             .persistent()
-            .get(&DataKey::Delegates(creator))
+            .get(&DataKey::Delegation(DelegationKey::List(creator)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -1756,7 +2385,7 @@ impl TipJarContract {
     pub fn get_delegation_history(env: Env, creator: Address) -> Vec<Delegation> {
         env.storage()
             .persistent()
-            .get(&DataKey::DelegationHistory(creator))
+            .get(&DataKey::Delegation(DelegationKey::History(creator.clone())))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -1778,11 +2407,11 @@ impl TipJarContract {
         let mut delegates: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::Delegates(creator.clone()))
+            .get(&DataKey::Delegation(DelegationKey::List(creator.clone())))
             .unwrap_or_else(|| Vec::new(env));
         if !delegates.contains(delegate) {
             delegates.push_back(delegate.clone());
-            env.storage().persistent().set(&DataKey::Delegates(creator.clone()), &delegates);
+            env.storage().persistent().set(&DataKey::Delegation(DelegationKey::List(creator.clone())), &delegates);
         }
     }
 
@@ -1790,7 +2419,7 @@ impl TipJarContract {
         let delegates: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::Delegates(creator.clone()))
+            .get(&DataKey::Delegation(DelegationKey::List(creator.clone())))
             .unwrap_or_else(|| Vec::new(env));
         let mut remaining = Vec::new(env);
         for d in delegates.iter() {
@@ -1800,19 +2429,19 @@ impl TipJarContract {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::Delegates(creator.clone()), &remaining);
+            .set(&DataKey::Delegation(DelegationKey::List(creator.clone())), &remaining);
     }
 
     fn append_delegation_history(env: &Env, creator: &Address, delegation: &Delegation) {
         let mut history: Vec<Delegation> = env
             .storage()
             .persistent()
-            .get(&DataKey::DelegationHistory(creator.clone()))
+            .get(&DataKey::Delegation(DelegationKey::History(creator.clone())))
             .unwrap_or_else(|| Vec::new(env));
         history.push_back(delegation.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::DelegationHistory(creator.clone()), &history);
+            .set(&DataKey::Delegation(DelegationKey::History(creator.clone())), &history);
     }
 
     /// Returns the current withdrawable balance for `creator` in `token`.
@@ -1853,6 +2482,7 @@ impl TipJarContract {
         vesting_duration: u64,
     ) -> u64 {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         tipper.require_auth();
 
         if amount <= 0 {
@@ -1875,7 +2505,7 @@ impl TipJarContract {
         }
 
         let now = env.ledger().timestamp();
-        let schedule_id: u64 = env.storage().instance().get(&DataKey::VestingSchedCtr).unwrap_or(0);
+        let schedule_id: u64 = env.storage().instance().get(&DataKey::Vesting(VestingKey::Ctr)).unwrap_or(0);
 
         let schedule = VestingSchedule {
             id: schedule_id,
@@ -1892,21 +2522,21 @@ impl TipJarContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::VestingSchedule(schedule_id), &schedule);
+            .set(&DataKey::Vesting(VestingKey::Schedule(schedule_id)), &schedule);
         
         let mut schedules: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::CreatorVestingList(creator.clone()))
+            .get(&DataKey::Vesting(VestingKey::CreatorList(creator.clone())))
             .unwrap_or_else(|| Vec::new(&env));
         schedules.push_back(schedule_id);
         env.storage()
             .persistent()
-            .set(&DataKey::CreatorVestingList(creator.clone()), &schedules);
+            .set(&DataKey::Vesting(VestingKey::CreatorList(creator.clone())), &schedules);
 
         env.storage()
             .instance()
-            .set(&DataKey::VestingSchedCtr, &(schedule_id + 1));
+            .set(&DataKey::Vesting(VestingKey::Ctr), &(schedule_id + 1));
 
         // Transfer tokens into contract for vesting
         token::Client::new(&env, &token).transfer(&tipper, &env.current_contract_address(), &amount);
@@ -1948,7 +2578,7 @@ impl TipJarContract {
         let schedule: VestingSchedule = env
             .storage()
             .persistent()
-            .get(&DataKey::VestingSchedule(schedule_id))
+            .get(&DataKey::Vesting(VestingKey::Schedule(schedule_id)))
             .unwrap_or_else(|| panic_with_error!(&env, TipJarError::VestingScheduleNotFound));
 
         Self::calculate_vested_amount(&env, &schedule)
@@ -1963,7 +2593,7 @@ impl TipJarContract {
         let schedule: VestingSchedule = env
             .storage()
             .persistent()
-            .get(&DataKey::VestingSchedule(schedule_id))
+            .get(&DataKey::Vesting(VestingKey::Schedule(schedule_id)))
             .unwrap_or_else(|| panic_with_error!(&env, TipJarError::VestingScheduleNotFound));
 
         let vested = Self::calculate_vested_amount(&env, &schedule);
@@ -1988,7 +2618,7 @@ impl TipJarContract {
         let mut schedule: VestingSchedule = env
             .storage()
             .persistent()
-            .get(&DataKey::VestingSchedule(schedule_id))
+            .get(&DataKey::Vesting(VestingKey::Schedule(schedule_id)))
             .unwrap_or_else(|| panic_with_error!(&env, TipJarError::VestingScheduleNotFound));
 
         if schedule.creator != creator {
@@ -2005,12 +2635,13 @@ impl TipJarContract {
         schedule.withdrawn = schedule.withdrawn.checked_add(available).expect("withdrawn overflow");
         env.storage()
             .persistent()
-            .set(&DataKey::VestingSchedule(schedule_id), &schedule);
+            .set(&DataKey::Vesting(VestingKey::Schedule(schedule_id)), &schedule);
 
+        let net_amount = Self::process_repayment(&env, &creator, &schedule.token, available);
         token::Client::new(&env, &schedule.token).transfer(
             &env.current_contract_address(),
             &creator,
-            &available,
+            &net_amount,
         );
 
         env.events().publish(
@@ -2028,14 +2659,14 @@ impl TipJarContract {
         }
         env.storage()
             .persistent()
-            .get(&DataKey::VestingSchedule(schedule_id))
+            .get(&DataKey::Vesting(VestingKey::Schedule(schedule_id)))
     }
 
     /// Returns all vesting schedule IDs for a creator.
     pub fn get_creator_vesting_schedules(env: Env, creator: Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::CreatorVestingList(creator))
+            .get(&DataKey::Vesting(VestingKey::CreatorList(creator)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -2061,8 +2692,8 @@ impl TipJarContract {
             _ => 0, // Monthly/Weekly not implemented; default to AllTime
         };
         let part_key = match kind {
-            ParticipantKind::Tipper => DataKey::TipperParticipants(bucket),
-            ParticipantKind::Creator => DataKey::CreatorParticipants(bucket),
+            ParticipantKind::Tipper => DataKey::Stats(StatsKey::TipperParts(bucket)),
+            ParticipantKind::Creator => DataKey::Stats(StatsKey::CreatorParts(bucket)),
         };
         let participants: Vec<Address> = env
             .storage()
@@ -2074,8 +2705,8 @@ impl TipJarContract {
         let mut entries = Vec::new(&env);
         for addr in participants.iter() {
             let agg_key = match kind {
-                ParticipantKind::Tipper => DataKey::TipperAggregate(addr.clone(), bucket),
-                ParticipantKind::Creator => DataKey::CreatorAggregate(addr.clone(), bucket),
+                ParticipantKind::Tipper => DataKey::Stats(StatsKey::TipperAgg(addr.clone(), bucket)),
+                ParticipantKind::Creator => DataKey::Stats(StatsKey::CreatorAgg(addr.clone(), bucket)),
             };
             if let Some(entry) = env.storage().persistent().get::<_, LeaderboardEntry>(&agg_key) {
                 entries.push_back(entry);
@@ -2122,6 +2753,7 @@ impl TipJarContract {
         condition_list: Vec<conditions::types::Condition>,
     ) -> bool {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         sender.require_auth();
 
         if amount <= 0 {
@@ -2133,8 +2765,9 @@ impl TipJarContract {
             return false;
         }
 
+        let net_amount = Self::process_repayment(&env, &creator, &token, amount);
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&sender, &creator, &amount);
+        token_client.transfer(&sender, &creator, &net_amount);
 
         env.events().publish(
             (symbol_short!("condtip"), sender.clone()),
@@ -2150,7 +2783,7 @@ impl TipJarContract {
     pub fn get_current_fee_bps(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::CurrentFeeBps)
+            .get(&DataKey::Fee(FeeKey::CurrentDynamic))
             .unwrap_or(fees::calculator::BASE_FEE_BPS)
     }
 
@@ -2170,6 +2803,7 @@ impl TipJarContract {
         congestion: u32,
     ) {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -2191,10 +2825,10 @@ impl TipJarContract {
         let (fee, fee_bps) = fees::compute_fee(&env, amount, level);
         
         // --- Insurance Premium Calculation ---
-        let ins_enabled: bool = env.storage().instance().get(&DataKey::InsEnabled).unwrap_or(true);
+        let ins_enabled: bool = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Enabled)).unwrap_or(true);
         let mut ins_premium: i128 = 0;
         if ins_enabled {
-            if let Some(config) = env.storage().instance().get::<DataKey, InsurancePoolConfig>(&DataKey::InsPoolCfg) {
+            if let Some(config) = env.storage().instance().get::<DataKey, InsurancePoolConfig>(&DataKey::Insurance(InsuranceKey::Cfg)) {
                 ins_premium = (amount * config.tip_premium_bps as i128) / 10_000;
             }
         }
@@ -2208,7 +2842,7 @@ impl TipJarContract {
         );
 
         if ins_premium > 0 {
-            let pool_key = DataKey::InsPoolToken(token.clone());
+            let pool_key = DataKey::Insurance(InsuranceKey::Token(token.clone()));
             let mut pool: InsurancePool = env
                 .storage()
                 .persistent()
@@ -2228,8 +2862,9 @@ impl TipJarContract {
 
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
         let current_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        let net_amount = Self::process_repayment(&env, &creator, &token, net);
         let new_bal: i128 = current_bal
-            .checked_add(net).expect("balance overflow");
+            .checked_add(net_amount).expect("balance overflow");
         env.storage().persistent().set(&bal_key, &new_bal);
 
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
@@ -2332,13 +2967,14 @@ impl TipJarContract {
         interval_seconds: u64,
     ) {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         subscriber.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
         }
         const MIN_INTERVAL: u64 = 86_400;
         if interval_seconds < MIN_INTERVAL {
-            panic_with_error!(&env, TipJarError::InvalidInterval);
+            panic_with_error!(&env, FeatureError::InvalidInterval);
         }
         let now = env.ledger().timestamp();
         let sub = Subscription {
@@ -2384,9 +3020,10 @@ impl TipJarContract {
             .persistent()
             .get(&DataKey::TierConfig(tier.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, TipJarError::TierNotConfigured));
+        Self::check_circuit_breaker(&env, config.price);
         const MIN_INTERVAL: u64 = 86_400;
         if interval_seconds < MIN_INTERVAL {
-            panic_with_error!(&env, TipJarError::InvalidInterval);
+            panic_with_error!(&env, FeatureError::InvalidInterval);
         }
         let now = env.ledger().timestamp();
         let amount = config.price;
@@ -2439,6 +3076,8 @@ impl TipJarContract {
             .get(&DataKey::TierConfig(new_tier.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, TipJarError::TierNotConfigured));
 
+        Self::check_circuit_breaker(&env, config.price);
+
         // Execute immediate payment at new tier price.
         token::Client::new(&env, &sub.token).transfer(
             &subscriber,
@@ -2447,7 +3086,8 @@ impl TipJarContract {
         );
         let bal_key = DataKey::CreatorBalance(creator.clone(), sub.token.clone());
         let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
-        env.storage().persistent().set(&bal_key, &(bal + config.price));
+        let net_amount = Self::process_repayment(&env, &creator, &sub.token, config.price);
+        env.storage().persistent().set(&bal_key, &(bal + net_amount));
         let tot_key = DataKey::CreatorTotal(creator.clone(), sub.token.clone());
         let tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
         env.storage().persistent().set(&tot_key, &(tot + config.price));
@@ -2521,8 +3161,10 @@ impl TipJarContract {
         }
         let now = env.ledger().timestamp();
         if now < sub.next_payment {
-            panic_with_error!(&env, TipJarError::PaymentNotDue);
+            panic_with_error!(&env, FeatureError::PaymentNotDue);
         }
+
+        Self::check_circuit_breaker(&env, sub.amount);
 
         // Apply pending downgrade if present.
         if let Some(pending) = sub.pending_tier.clone() {
@@ -2545,7 +3187,8 @@ impl TipJarContract {
 
         let bal_key = DataKey::CreatorBalance(creator.clone(), sub.token.clone());
         let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
-        env.storage().persistent().set(&bal_key, &(bal + sub.amount));
+        let net_amount = Self::process_repayment(&env, &creator, &sub.token, sub.amount);
+        env.storage().persistent().set(&bal_key, &(bal + net_amount));
 
         let tot_key = DataKey::CreatorTotal(creator.clone(), sub.token.clone());
         let tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
@@ -2653,6 +3296,7 @@ impl TipJarContract {
         message: Option<String>,
     ) -> u64 {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         sender.require_auth();
 
         // Validate message length by character count (not bytes) to support emoji.
@@ -2686,15 +3330,15 @@ impl TipJarContract {
         let fee_bp: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::FeeBasisPoints)
+            .get(&DataKey::Fee(FeeKey::BasisPoints))
             .unwrap_or(0);
         let fee: i128 = (amount * fee_bp as i128) / 10_000;
 
         // --- Insurance Premium Calculation ---
-        let ins_enabled: bool = env.storage().instance().get(&DataKey::InsEnabled).unwrap_or(true);
+        let ins_enabled: bool = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Enabled)).unwrap_or(true);
         let mut ins_premium: i128 = 0;
         if ins_enabled {
-            if let Some(config) = env.storage().instance().get::<DataKey, InsurancePoolConfig>(&DataKey::InsPoolCfg) {
+            if let Some(config) = env.storage().instance().get::<DataKey, InsurancePoolConfig>(&DataKey::Insurance(InsuranceKey::Cfg)) {
                 ins_premium = (amount * config.tip_premium_bps as i128) / 10_000;
             }
         }
@@ -2702,14 +3346,14 @@ impl TipJarContract {
         let creator_amount = amount.checked_sub(fee).and_then(|a| a.checked_sub(ins_premium)).unwrap_or(0);
 
         if fee > 0 {
-            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let fee_key = DataKey::Fee(FeeKey::Balance(token.clone()));
             let new_fee_bal: i128 =
                 env.storage().instance().get(&fee_key).unwrap_or(0) + fee;
             env.storage().instance().set(&fee_key, &new_fee_bal);
         }
 
         if ins_premium > 0 {
-            let pool_key = DataKey::InsPoolToken(token.clone());
+            let pool_key = DataKey::Insurance(InsuranceKey::Token(token.clone()));
             let mut pool: InsurancePool = env
                 .storage()
                 .persistent()
@@ -2733,9 +3377,10 @@ impl TipJarContract {
             .persistent()
             .get(&bal_key)
             .unwrap_or_else(|| env.storage().instance().get(&bal_key).unwrap_or(0));
+        let net_amount = Self::process_repayment(&env, &creator, &token, creator_amount);
         env.storage()
             .persistent()
-            .set(&bal_key, &(existing_bal + creator_amount));
+            .set(&bal_key, &(existing_bal + net_amount));
 
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
         let existing_tot: i128 = env
@@ -2750,7 +3395,7 @@ impl TipJarContract {
         Self::update_leaderboard_stats(&env, &sender, &creator, amount);
 
         // Store metadata and increment tip count.
-        let count_key = DataKey::TipCount(creator.clone());
+        let count_key = DataKey::Tip(TipKey::Count(creator.clone()));
         let tip_index: u64 = env
             .storage()
             .persistent()
@@ -2766,7 +3411,7 @@ impl TipJarContract {
         };
         env.storage()
             .persistent()
-            .set(&DataKey::TipHistory(creator.clone(), tip_index), &metadata);
+            .set(&DataKey::Tip(TipKey::History(creator.clone(), tip_index)), &metadata);
         env.storage()
             .persistent()
             .set(&count_key, &(tip_index + 1));
@@ -2783,7 +3428,7 @@ impl TipJarContract {
     ///
     /// `limit` is capped at 100 to bound storage reads.
     pub fn get_tip_history(env: Env, creator: Address, limit: u32) -> Vec<TipMetadata> {
-        let count_key = DataKey::TipCount(creator.clone());
+        let count_key = DataKey::Tip(TipKey::Count(creator.clone()));
         let total: u64 = env
             .storage()
             .persistent()
@@ -2805,7 +3450,7 @@ impl TipJarContract {
             if let Some(meta) = env
                 .storage()
                 .persistent()
-                .get::<_, TipMetadata>(&DataKey::TipHistory(creator.clone(), idx))
+                .get::<_, TipMetadata>(&DataKey::Tip(TipKey::History(creator.clone(), idx)))
             {
                 result.push_back(meta);
                 fetched += 1;
@@ -2831,23 +3476,24 @@ impl TipJarContract {
         amount: i128,
     ) {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
         }
         let count = recipients.len();
         if count < 2 || count > 10 {
-            panic_with_error!(&env, TipJarError::InvalidRecipientCount);
+            panic_with_error!(&env, FeatureError::InvalidRecipientCount);
         }
         let mut total_pct: u32 = 0;
         for r in recipients.iter() {
             if r.percentage == 0 {
-                panic_with_error!(&env, TipJarError::InvalidPercentage);
+                panic_with_error!(&env, FeatureError::InvalidPercentage);
             }
             total_pct += r.percentage;
         }
         if total_pct != 10_000 {
-            panic_with_error!(&env, TipJarError::InvalidPercentageSum);
+            panic_with_error!(&env, FeatureError::InvalidPercentageSum);
         }
 
         let whitelisted: bool = env
@@ -2876,7 +3522,8 @@ impl TipJarContract {
 
             let bal_key = DataKey::CreatorBalance(r.creator.clone(), token.clone());
             let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
-            env.storage().persistent().set(&bal_key, &(bal + share));
+            let net_amount = Self::process_repayment(&env, &r.creator, &token, share);
+            env.storage().persistent().set(&bal_key, &(bal + net_amount));
 
             let tot_key = DataKey::CreatorTotal(r.creator.clone(), token.clone());
             let tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
@@ -2900,15 +3547,15 @@ impl TipJarContract {
         if admin != stored_admin {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
-        env.storage().persistent().set(&DataKey::UserRole(user.clone()), &role);
+        env.storage().persistent().set(&DataKey::Role(RoleKey::User(user.clone())), &role);
         let mut members: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::RoleMembers(role.clone()))
+            .get(&DataKey::Role(RoleKey::Members(role.clone())))
             .unwrap_or_else(|| Vec::new(&env));
         if !members.contains(&user) {
             members.push_back(user.clone());
-            env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+            env.storage().persistent().set(&DataKey::Role(RoleKey::Members(role.clone())), &members);
         }
         env.events().publish((symbol_short!("role_grt"),), (user, role));
     }
@@ -2923,16 +3570,16 @@ impl TipJarContract {
         if let Some(role) = env
             .storage()
             .persistent()
-            .get::<DataKey, Role>(&DataKey::UserRole(user.clone()))
+            .get::<DataKey, Role>(&DataKey::Role(RoleKey::User(user.clone())))
         {
-            env.storage().persistent().remove(&DataKey::UserRole(user.clone()));
+            env.storage().persistent().remove(&DataKey::Role(RoleKey::User(user.clone())));
             let mut members: Vec<Address> = env
                 .storage()
                 .persistent()
-                .get(&DataKey::RoleMembers(role.clone()))
+                .get(&DataKey::Role(RoleKey::Members(role.clone())))
                 .unwrap_or_else(|| Vec::new(&env));
             members.retain(|a| a != user);
-            env.storage().persistent().set(&DataKey::RoleMembers(role.clone()), &members);
+            env.storage().persistent().set(&DataKey::Role(RoleKey::Members(role.clone())), &members);
             env.events().publish((symbol_short!("role_rev"),), (user, role));
         }
     }
@@ -2941,7 +3588,7 @@ impl TipJarContract {
     pub fn has_role(env: Env, user: Address, role: Role) -> bool {
         env.storage()
             .persistent()
-            .get::<DataKey, Role>(&DataKey::UserRole(user))
+            .get::<DataKey, Role>(&DataKey::Role(RoleKey::User(user.clone())))
             .map(|r| r == role)
             .unwrap_or(false)
     }
@@ -2952,7 +3599,7 @@ impl TipJarContract {
         let stored: Option<Role> = env
             .storage()
             .persistent()
-            .get(&DataKey::UserRole(user.clone()));
+            .get(&DataKey::Role(RoleKey::User(user.clone())));
         if stored != Some(role) {
             panic_with_error!(env, TipJarError::Unauthorized);
         }
@@ -2962,7 +3609,7 @@ impl TipJarContract {
     pub fn get_role_members(env: Env, role: Role) -> Vec<Address> {
         env.storage()
             .persistent()
-            .get(&DataKey::RoleMembers(role))
+            .get(&DataKey::Role(RoleKey::Members(role)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -2982,6 +3629,7 @@ impl TipJarContract {
         unlock_time: u64,
     ) -> u64 {
         Self::require_not_paused(&env);
+        Self::check_circuit_breaker(&env, amount);
         sender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
@@ -3058,16 +3706,16 @@ impl TipJarContract {
             .storage()
             .persistent()
             .get(&DataKey::TimeLock(lock_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::LockNotFound));
 
         if time_lock.creator != creator {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
         if time_lock.cancelled {
-            panic_with_error!(&env, TipJarError::LockCancelled);
+            panic_with_error!(&env, FeatureError::LockCancelled);
         }
         if env.ledger().timestamp() < time_lock.unlock_time {
-            panic_with_error!(&env, TipJarError::NotUnlocked);
+            panic_with_error!(&env, FeatureError::NotUnlocked);
         }
 
         // State update before external call (CEI).
@@ -3102,13 +3750,13 @@ impl TipJarContract {
             .storage()
             .persistent()
             .get(&DataKey::TimeLock(lock_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::LockNotFound));
 
         if time_lock.sender != sender {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
         if time_lock.cancelled {
-            panic_with_error!(&env, TipJarError::LockCancelled);
+            panic_with_error!(&env, FeatureError::LockCancelled);
         }
 
         // State update before external call (CEI).
@@ -3159,7 +3807,7 @@ impl TipJarContract {
             .storage()
             .persistent()
             .get(&DataKey::TimeLock(lock_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::LockNotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::LockNotFound));
 
         if time_lock.creator != creator {
             panic_with_error!(&env, TipJarError::Unauthorized);
@@ -3315,8 +3963,8 @@ impl TipJarContract {
         let mut limits: WithdrawalLimits = env
             .storage()
             .persistent()
-            .get(&DataKey::WithdrawalLimits(creator.clone()))
-            .or_else(|| env.storage().instance().get(&DataKey::DefWithdrawLimits))
+            .get(&DataKey::Limit(LimitKey::Withdrawal(creator.clone())))
+            .or_else(|| env.storage().instance().get(&DataKey::Limit(LimitKey::Default)))
             .unwrap_or(WithdrawalLimits {
                 daily_limit: 0,
                 cooldown_seconds: 0,
@@ -3330,7 +3978,7 @@ impl TipJarContract {
         // Cooldown check.
         if limits.cooldown_seconds > 0 && limits.last_withdrawal > 0 {
             if now < limits.last_withdrawal + limits.cooldown_seconds {
-                panic_with_error!(env, TipJarError::WithdrawalCooldown);
+                panic_with_error!(env, FeatureError::WithdrawalCooldown);
             }
         }
 
@@ -3343,7 +3991,7 @@ impl TipJarContract {
         // Daily limit check (0 = unlimited).
         if limits.daily_limit > 0 {
             if limits.withdrawn_today + amount > limits.daily_limit {
-                panic_with_error!(env, TipJarError::DailyLimitExceeded);
+                panic_with_error!(env, FeatureError::DailyLimitExceeded);
             }
         }
 
@@ -3351,7 +3999,7 @@ impl TipJarContract {
         limits.last_withdrawal = now;
         env.storage()
             .persistent()
-            .set(&DataKey::WithdrawalLimits(creator.clone()), &limits);
+            .set(&DataKey::Limit(LimitKey::Withdrawal(creator.clone())), &limits);
     }
 
     /// Sets per-creator withdrawal limits. Admin only.
@@ -3374,7 +4022,7 @@ impl TipJarContract {
         let existing: WithdrawalLimits = env
             .storage()
             .persistent()
-            .get(&DataKey::WithdrawalLimits(creator.clone()))
+            .get(&DataKey::Limit(LimitKey::Withdrawal(creator.clone())))
             .unwrap_or(WithdrawalLimits {
                 daily_limit: 0,
                 cooldown_seconds: 0,
@@ -3392,7 +4040,7 @@ impl TipJarContract {
         };
         env.storage()
             .persistent()
-            .set(&DataKey::WithdrawalLimits(creator.clone()), &limits);
+            .set(&DataKey::Limit(LimitKey::Withdrawal(creator.clone())), &limits);
 
         env.events().publish(
             (symbol_short!("wl_set"), creator),
@@ -3425,7 +4073,7 @@ impl TipJarContract {
         };
         env.storage()
             .instance()
-            .set(&DataKey::DefWithdrawLimits, &defaults);
+            .set(&DataKey::Limit(LimitKey::Default), &defaults);
 
         env.events()
             .publish((symbol_short!("wl_def"),), (daily_limit, cooldown_seconds));
@@ -3465,8 +4113,8 @@ impl TipJarContract {
     pub fn get_withdrawal_limits(env: Env, creator: Address) -> WithdrawalLimits {
         env.storage()
             .persistent()
-            .get(&DataKey::WithdrawalLimits(creator))
-            .or_else(|| env.storage().instance().get(&DataKey::DefWithdrawLimits))
+            .get(&DataKey::Limit(LimitKey::Withdrawal(creator)))
+            .or_else(|| env.storage().instance().get(&DataKey::Limit(LimitKey::Default)))
             .unwrap_or(WithdrawalLimits {
                 daily_limit: 0,
                 cooldown_seconds: 0,
@@ -3499,7 +4147,7 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
         let cfg = MultiSigConfig { threshold, required_approvals, expiry_seconds, signers };
-        env.storage().instance().set(&DataKey::MultiSigConfig, &cfg);
+        env.storage().instance().set(&DataKey::MultiSig(MultiSigKey::Config), &cfg);
         env.events().publish(
             (symbol_short!("ms_cfg"),),
             (threshold, required_approvals, expiry_seconds),
@@ -3531,8 +4179,8 @@ impl TipJarContract {
         let cfg: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MultiSigNotConfigured));
+            .get(&DataKey::MultiSig(MultiSigKey::Config))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::MultiSigNotConfigured));
 
         // Below-or-at threshold: process immediately.
         if cfg.threshold > 0 && amount <= cfg.threshold {
@@ -3551,9 +4199,9 @@ impl TipJarContract {
         let request_id: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigCounter)
+            .get(&DataKey::MultiSig(MultiSigKey::Ctr))
             .unwrap_or(0);
-        env.storage().instance().set(&DataKey::MultiSigCounter, &(request_id + 1));
+        env.storage().instance().set(&DataKey::MultiSig(MultiSigKey::Ctr), &(request_id + 1));
 
         let expires_at = env.ledger().timestamp() + cfg.expiry_seconds;
         let request = MultiSigWithdrawal {
@@ -3567,7 +4215,7 @@ impl TipJarContract {
             executed: false,
             cancelled: false,
         };
-        env.storage().persistent().set(&DataKey::MultiSigRequest(request_id), &request);
+        env.storage().persistent().set(&DataKey::MultiSig(MultiSigKey::Request(request_id)), &request);
 
         env.events().publish(
             (symbol_short!("ms_req"), creator),
@@ -3588,27 +4236,27 @@ impl TipJarContract {
         let cfg: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MultiSigNotConfigured));
+            .get(&DataKey::MultiSig(MultiSigKey::Config))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::MultiSigNotConfigured));
 
         if !cfg.signers.contains(&approver) {
-            panic_with_error!(&env, TipJarError::NotASigner);
+            panic_with_error!(&env, FeatureError::NotASigner);
         }
 
         let mut request: MultiSigWithdrawal = env
             .storage()
             .persistent()
-            .get(&DataKey::MultiSigRequest(request_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MsigReqNotFound));
+            .get(&DataKey::MultiSig(MultiSigKey::Request(request_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::MsigReqNotFound));
 
         if request.executed || request.cancelled {
-            panic_with_error!(&env, TipJarError::MultiSigReqClosed);
+            panic_with_error!(&env, FeatureError::MultiSigReqClosed);
         }
         if env.ledger().timestamp() > request.expires_at {
-            panic_with_error!(&env, TipJarError::MultiSigReqExpired);
+            panic_with_error!(&env, FeatureError::MultiSigReqExpired);
         }
         if request.approvals.contains(&approver) {
-            panic_with_error!(&env, TipJarError::AlreadyApproved);
+            panic_with_error!(&env, FeatureError::AlreadyApproved);
         }
 
         request.approvals.push_back(approver.clone());
@@ -3623,7 +4271,7 @@ impl TipJarContract {
             }
             env.storage().persistent().set(&bal_key, &(balance - request.amount));
             request.executed = true;
-            env.storage().persistent().set(&DataKey::MultiSigRequest(request_id), &request);
+            env.storage().persistent().set(&DataKey::MultiSig(MultiSigKey::Request(request_id)), &request);
 
             token::Client::new(&env, &request.token).transfer(
                 &env.current_contract_address(),
@@ -3635,7 +4283,7 @@ impl TipJarContract {
                 (request_id, request.amount),
             );
         } else {
-            env.storage().persistent().set(&DataKey::MultiSigRequest(request_id), &request);
+            env.storage().persistent().set(&DataKey::MultiSig(MultiSigKey::Request(request_id)), &request);
         }
     }
 
@@ -3649,11 +4297,11 @@ impl TipJarContract {
         let mut request: MultiSigWithdrawal = env
             .storage()
             .persistent()
-            .get(&DataKey::MultiSigRequest(request_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MsigReqNotFound));
+            .get(&DataKey::MultiSig(MultiSigKey::Request(request_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::MsigReqNotFound));
 
         if request.executed || request.cancelled {
-            panic_with_error!(&env, TipJarError::MultiSigReqClosed);
+            panic_with_error!(&env, FeatureError::MultiSigReqClosed);
         }
 
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -3662,7 +4310,7 @@ impl TipJarContract {
         }
 
         request.cancelled = true;
-        env.storage().persistent().set(&DataKey::MultiSigRequest(request_id), &request);
+        env.storage().persistent().set(&DataKey::MultiSig(MultiSigKey::Request(request_id)), &request);
         env.events().publish((symbol_short!("ms_cncl"), request.creator), request_id);
     }
 
@@ -3670,16 +4318,16 @@ impl TipJarContract {
     pub fn get_multisig_request(env: Env, request_id: u64) -> MultiSigWithdrawal {
         env.storage()
             .persistent()
-            .get(&DataKey::MultiSigRequest(request_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MsigReqNotFound))
+            .get(&DataKey::MultiSig(MultiSigKey::Request(request_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::MsigReqNotFound))
     }
 
     /// Returns the current multi-sig configuration.
     pub fn get_multisig_config(env: Env) -> MultiSigConfig {
         env.storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MultiSigNotConfigured))
+            .get(&DataKey::MultiSig(MultiSigKey::Config))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::MultiSigNotConfigured))
     }
 
     // ── upgrade / migration ───────────────────────────────────────────────────
@@ -3714,8 +4362,8 @@ impl TipJarContract {
         Self::require_not_paused(&env);
         initiator.require_auth();
 
-        let dispute_id: u64 = env.storage().instance().get(&DataKey::DisputeCounter).unwrap_or(0);
-        env.storage().instance().set(&DataKey::DisputeCounter, &(dispute_id + 1));
+        let dispute_id: u64 = env.storage().instance().get(&DataKey::Dispute(DisputeKey::Ctr)).unwrap_or(0);
+        env.storage().instance().set(&DataKey::Dispute(DisputeKey::Ctr), &(dispute_id + 1));
 
         let created_at = env.ledger().timestamp();
         let dispute = dispute::Dispute {
@@ -3729,17 +4377,17 @@ impl TipJarContract {
             created_at,
         };
 
-        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+        env.storage().persistent().set(&DataKey::Dispute(DisputeKey::Record(dispute_id)), &dispute);
 
         let mut creator_disputes: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::CreatorDisputes(initiator.clone()))
+            .get(&DataKey::Dispute(DisputeKey::CreatorList(initiator.clone())))
             .unwrap_or_else(|| Vec::new(&env));
         creator_disputes.push_back(dispute_id);
         env.storage()
             .persistent()
-            .set(&DataKey::CreatorDisputes(initiator.clone()), &creator_disputes);
+            .set(&DataKey::Dispute(DisputeKey::CreatorList(initiator.clone())), &creator_disputes);
 
         env.events().publish(
             (symbol_short!("disp_crt"),),
@@ -3762,12 +4410,12 @@ impl TipJarContract {
         let mut dispute: dispute::Dispute = env
             .storage()
             .persistent()
-            .get(&DataKey::Dispute(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound));
+            .get(&DataKey::Dispute(DisputeKey::Record(dispute_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::DisputeNotFound));
 
         dispute.arbitrator = Some(arbitrator.clone());
         dispute.status = dispute::DisputeStatus::UnderReview;
-        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+        env.storage().persistent().set(&DataKey::Dispute(DisputeKey::Record(dispute_id)), &dispute);
 
         env.events().publish(
             (symbol_short!("disp_asgn"),),
@@ -3790,17 +4438,17 @@ impl TipJarContract {
         let dispute: dispute::Dispute = env
             .storage()
             .persistent()
-            .get(&DataKey::Dispute(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound));
+            .get(&DataKey::Dispute(DisputeKey::Record(dispute_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::DisputeNotFound));
 
         if dispute.status != dispute::DisputeStatus::Open && dispute.status != dispute::DisputeStatus::UnderReview {
-            panic_with_error!(&env, TipJarError::DisputeNotOpen);
+            panic_with_error!(&env, FeatureError::DisputeNotOpen);
         }
 
         let evidence_idx: u64 = env
             .storage()
             .persistent()
-            .get(&DataKey::DisputeEvidenceCounter(dispute_id))
+            .get(&DataKey::Dispute(DisputeKey::EvidenceCtr(dispute_id)))
             .unwrap_or(0);
 
         let submitted_at = env.ledger().timestamp();
@@ -3813,10 +4461,10 @@ impl TipJarContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::DisputeEvidence(dispute_id, evidence_idx), &evidence_record);
+            .set(&DataKey::Dispute(DisputeKey::Evidence(dispute_id, evidence_idx)), &evidence_record);
         env.storage()
             .persistent()
-            .set(&DataKey::DisputeEvidenceCounter(dispute_id), &(evidence_idx + 1));
+            .set(&DataKey::Dispute(DisputeKey::EvidenceCtr(dispute_id)), &(evidence_idx + 1));
 
         env.events().publish(
             (symbol_short!("evid_sub"),),
@@ -3840,11 +4488,11 @@ impl TipJarContract {
         let mut dispute: dispute::Dispute = env
             .storage()
             .persistent()
-            .get(&DataKey::Dispute(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound));
+            .get(&DataKey::Dispute(DisputeKey::Record(dispute_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::DisputeNotFound));
 
         if dispute.arbitrator != Some(arbitrator.clone()) {
-            panic_with_error!(&env, TipJarError::DisputeUnauthorized);
+            panic_with_error!(&env, InsuranceError::DisputeUnauthorized);
         }
 
         dispute.resolution = Some(resolution.clone());
@@ -3854,7 +4502,7 @@ impl TipJarContract {
             dispute::DisputeStatus::Rejected
         };
 
-        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+        env.storage().persistent().set(&DataKey::Dispute(DisputeKey::Record(dispute_id)), &dispute);
 
         env.events().publish(
             (symbol_short!("disp_res"),),
@@ -3866,15 +4514,15 @@ impl TipJarContract {
     pub fn get_dispute(env: Env, dispute_id: u64) -> dispute::Dispute {
         env.storage()
             .persistent()
-            .get(&DataKey::Dispute(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound))
+            .get(&DataKey::Dispute(DisputeKey::Record(dispute_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::DisputeNotFound))
     }
 
     /// Returns all disputes for a creator.
     pub fn get_creator_disputes(env: Env, creator: Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::CreatorDisputes(creator))
+            .get(&DataKey::Dispute(DisputeKey::CreatorList(creator)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -3882,8 +4530,8 @@ impl TipJarContract {
     pub fn get_dispute_evidence(env: Env, dispute_id: u64, evidence_idx: u64) -> dispute::DisputeEvidence {
         env.storage()
             .persistent()
-            .get(&DataKey::DisputeEvidence(dispute_id, evidence_idx))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::DisputeNotFound))
+            .get(&DataKey::Dispute(DisputeKey::Evidence(dispute_id, evidence_idx)))
+            .unwrap_or_else(|| panic_with_error!(&env, FeatureError::DisputeNotFound))
     }
 
     // ── batch tipping ─────────────────────────────────────────────────────────
@@ -3922,10 +4570,12 @@ impl TipJarContract {
             total_amount = total_amount.checked_add(tip.amount).expect("total overflow");
         }
 
+        Self::check_circuit_breaker(&env, total_amount);
+
         // Transfer all tokens at once
         token::Client::new(&env, &token).transfer(&tipper, &env.current_contract_address(), &total_amount);
 
-        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::Fee(FeeKey::BasisPoints)).unwrap_or(0);
         let mut successful_tips: u32 = 0;
 
         for tip in tips.iter() {
@@ -3933,7 +4583,7 @@ impl TipJarContract {
             let creator_amount = tip.amount - fee;
 
             if fee > 0 {
-                let fee_key = DataKey::PlatformFeeBalance(token.clone());
+                let fee_key = DataKey::Fee(FeeKey::Balance(token.clone()));
                 let new_fee_bal: i128 = env
                     .storage()
                     .instance()
@@ -3946,7 +4596,8 @@ impl TipJarContract {
 
             let bal_key = DataKey::CreatorBalance(tip.creator.clone(), token.clone());
             let existing_bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
-            let new_bal: i128 = existing_bal.checked_add(creator_amount).expect("balance overflow");
+            let net_amount = Self::process_repayment(&env, &tip.creator, &token, creator_amount);
+            let new_bal: i128 = existing_bal.checked_add(net_amount).expect("balance overflow");
             env.storage().persistent().set(&bal_key, &new_bal);
 
             let tot_key = DataKey::CreatorTotal(tip.creator.clone(), token.clone());
@@ -3992,7 +4643,7 @@ impl TipJarContract {
                 updated_milestone.completed = true;
                 env.storage()
                     .persistent()
-                    .set(&DataKey::Milestone(creator.clone(), idx as u64), &updated_milestone);
+                    .set(&DataKey::Milestone(MilestoneKey::Record(creator.clone(), idx as u64)), &updated_milestone);
 
                 env.events().publish(
                     (symbol_short!("milestone"),),
@@ -4022,7 +4673,7 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::InvalidGoalAmount);
         }
 
-        let counter_key = DataKey::MilestoneCounter(creator.clone());
+        let counter_key = DataKey::Milestone(MilestoneKey::Counter(creator.clone()));
         let milestone_id: u64 = env.storage().persistent().get(&counter_key).unwrap_or(0);
 
         let milestone = Milestone {
@@ -4037,7 +4688,7 @@ impl TipJarContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Milestone(creator.clone(), milestone_id), &milestone);
+            .set(&DataKey::Milestone(MilestoneKey::Record(creator.clone(), milestone_id)), &milestone);
         env.storage()
             .persistent()
             .set(&counter_key, &(milestone_id + 1));
@@ -4045,12 +4696,12 @@ impl TipJarContract {
         let mut active: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::ActiveMilestones(creator.clone()))
+            .get(&DataKey::Milestone(MilestoneKey::Active(creator.clone())))
             .unwrap_or_else(|| Vec::new(&env));
         active.push_back(milestone_id);
         env.storage()
             .persistent()
-            .set(&DataKey::ActiveMilestones(creator.clone()), &active);
+            .set(&DataKey::Milestone(MilestoneKey::Active(creator.clone())), &active);
 
         env.events().publish(
             (symbol_short!("ms_crt"),),
@@ -4061,19 +4712,19 @@ impl TipJarContract {
     }
 
     /// Returns all milestones for a creator.
-    pub fn get_creator_milestones(env: &Env, creator: &Address) -> Vec<Milestone> {
+    pub fn get_creator_milestones(env: Env, creator: Address) -> Vec<Milestone> {
         let milestone_ids: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::ActiveMilestones(creator.clone()))
-            .unwrap_or_else(|| Vec::new(env));
+            .get(&DataKey::Milestone(MilestoneKey::Active(creator.clone())))
+            .unwrap_or_else(|| Vec::new(&env));
 
-        let mut milestones = Vec::new(env);
+        let mut milestones = Vec::new(&env);
         for id in milestone_ids.iter() {
             if let Some(milestone) = env
                 .storage()
                 .persistent()
-                .get::<_, Milestone>(&DataKey::Milestone(creator.clone(), id))
+                .get::<_, Milestone>(&DataKey::Milestone(MilestoneKey::Record(creator.clone(), id)))
             {
                 milestones.push_back(milestone);
             }
@@ -4085,7 +4736,7 @@ impl TipJarContract {
     pub fn get_milestone(env: Env, creator: Address, milestone_id: u64) -> Milestone {
         env.storage()
             .persistent()
-            .get(&DataKey::Milestone(creator, milestone_id))
+            .get(&DataKey::Milestone(MilestoneKey::Record(creator, milestone_id)))
             .unwrap_or_else(|| panic_with_error!(&env, TipJarError::MilestoneNotFound))
     }
 
@@ -4117,8 +4768,8 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
         }
 
-        let tip_id: u64 = env.storage().instance().get(&DataKey::PrivateTipCounter).unwrap_or(0);
-        env.storage().instance().set(&DataKey::PrivateTipCounter, &(tip_id + 1));
+        let tip_id: u64 = env.storage().instance().get(&DataKey::PrivateTip(PrivateTipKey::Ctr)).unwrap_or(0);
+        env.storage().instance().set(&DataKey::PrivateTip(PrivateTipKey::Ctr), &(tip_id + 1));
 
         let amount_bytes = amount.to_le_bytes();
         let amount_hash = env.crypto().sha256(&amount_bytes);
@@ -4140,7 +4791,7 @@ impl TipJarContract {
             revealed: false,
         };
 
-        env.storage().persistent().set(&DataKey::PrivateTip(tip_id), &private_tip);
+        env.storage().persistent().set(&DataKey::PrivateTip(PrivateTipKey::Record(tip_id)), &private_tip);
 
         env.events().publish(
             (symbol_short!("priv_tip"),),
@@ -4172,14 +4823,14 @@ impl TipJarContract {
         let mut private_tip: privacy_tip::PrivateTip = env
             .storage()
             .persistent()
-            .get(&DataKey::PrivateTip(tip_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::PrivateTipNotFound));
+            .get(&DataKey::PrivateTip(PrivateTipKey::Record(tip_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::PrivateTipNotFound));
 
         let amount_bytes = amount.to_le_bytes();
         let computed_hash = env.crypto().sha256(&amount_bytes);
 
         if computed_hash != private_tip.amount_hash {
-            panic_with_error!(&env, TipJarError::InvalidReveal);
+            panic_with_error!(&env, InsuranceError::InvalidReveal);
         }
 
         let whitelisted: bool = env
@@ -4194,12 +4845,12 @@ impl TipJarContract {
         // Transfer tokens
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
 
-        let fee_bp: u32 = env.storage().instance().get(&DataKey::FeeBasisPoints).unwrap_or(0);
+        let fee_bp: u32 = env.storage().instance().get(&DataKey::Fee(FeeKey::BasisPoints)).unwrap_or(0);
         let fee: i128 = (amount * fee_bp as i128) / 10_000;
         let creator_amount = amount - fee;
 
         if fee > 0 {
-            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let fee_key = DataKey::Fee(FeeKey::Balance(token.clone()));
             let current_fee: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
             let new_fee_bal: i128 = current_fee
                 .checked_add(fee)
@@ -4218,8 +4869,8 @@ impl TipJarContract {
         env.storage().persistent().set(&tot_key, &new_tot);
 
         private_tip.revealed = true;
-        env.storage().persistent().set(&DataKey::PrivateTip(tip_id), &private_tip);
-        env.storage().persistent().set(&DataKey::PrivateTipAmount(tip_id), &amount);
+        env.storage().persistent().set(&DataKey::PrivateTip(PrivateTipKey::Record(tip_id)), &private_tip);
+        env.storage().persistent().set(&DataKey::PrivateTip(PrivateTipKey::Amount(tip_id)), &amount);
 
         env.events().publish(
             (symbol_short!("tip_rev"),),
@@ -4231,15 +4882,15 @@ impl TipJarContract {
     pub fn get_private_tip(env: Env, tip_id: u64) -> privacy_tip::PrivateTip {
         env.storage()
             .persistent()
-            .get(&DataKey::PrivateTip(tip_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::PrivateTipNotFound))
+            .get(&DataKey::PrivateTip(PrivateTipKey::Record(tip_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::PrivateTipNotFound))
     }
 
     /// Returns the revealed amount for a private tip (if revealed).
     pub fn get_private_tip_amount(env: Env, tip_id: u64) -> Option<i128> {
         env.storage()
             .persistent()
-            .get(&DataKey::PrivateTipAmount(tip_id))
+            .get(&DataKey::PrivateTip(PrivateTipKey::Amount(tip_id)))
     }
 
     // ── streaming protocol ──────────────────────────────────────────────────────
@@ -4262,12 +4913,12 @@ impl TipJarContract {
         sender.require_auth();
 
         if amount_per_second <= 0 {
-            panic_with_error!(&env, TipJarError::InvalidStreamRate);
+            panic_with_error!(&env, InsuranceError::InvalidStreamRate);
         }
 
         // Maximum rate: 1000 tokens/second (adjust as needed)
         if amount_per_second > 1000 {
-            panic_with_error!(&env, TipJarError::StrmRateMax);
+            panic_with_error!(&env, AuctionError::StrmRateMax);
         }
 
         if duration == 0 {
@@ -4283,7 +4934,7 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
         }
 
-        let stream_id: u64 = env.storage().instance().get(&DataKey::StreamCounter).unwrap_or(0);
+        let stream_id: u64 = env.storage().instance().get(&DataKey::Stream(StreamKey::Ctr)).unwrap_or(0);
         let now = env.ledger().timestamp();
         let total_amount = amount_per_second * duration as i128;
 
@@ -4301,26 +4952,26 @@ impl TipJarContract {
             updated_at: now,
         };
 
-        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
-        env.storage().instance().set(&DataKey::StreamCounter, &(stream_id + 1));
+        env.storage().persistent().set(&DataKey::Stream(StreamKey::Record(stream_id)), &stream);
+        env.storage().instance().set(&DataKey::Stream(StreamKey::Ctr), &(stream_id + 1));
 
         // Add to sender's stream list
         let mut sender_streams: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::SenderStreams(sender.clone()))
+            .get(&DataKey::Stream(StreamKey::SenderStreams(sender.clone())))
             .unwrap_or_else(|| Vec::new(&env));
         sender_streams.push_back(stream_id);
-        env.storage().persistent().set(&DataKey::SenderStreams(sender.clone()), &sender_streams);
+        env.storage().persistent().set(&DataKey::Stream(StreamKey::SenderStreams(sender.clone())), &sender_streams);
 
         // Add to creator's stream list
         let mut creator_streams: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::CreatorStreams(creator.clone()))
+            .get(&DataKey::Stream(StreamKey::CreatorStreams(creator.clone())))
             .unwrap_or_else(|| Vec::new(&env));
         creator_streams.push_back(stream_id);
-        env.storage().persistent().set(&DataKey::CreatorStreams(creator.clone()), &creator_streams);
+        env.storage().persistent().set(&DataKey::Stream(StreamKey::CreatorStreams(creator.clone())), &creator_streams);
 
         // Transfer total amount into escrow
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &total_amount);
@@ -4365,19 +5016,19 @@ impl TipJarContract {
         let mut stream: Stream = env
             .storage()
             .persistent()
-            .get(&DataKey::Stream(stream_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+            .get(&DataKey::Stream(StreamKey::Record(stream_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::StreamNotFound));
 
         if stream.sender != sender {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
 
         if stream.status == StreamStatus::Cancelled {
-            panic_with_error!(&env, TipJarError::StreamAlreadyCancelled);
+            panic_with_error!(&env, InsuranceError::StreamAlreadyCancelled);
         }
 
         if stream.status == StreamStatus::Completed {
-            panic_with_error!(&env, TipJarError::StreamAlreadyCompleted);
+            panic_with_error!(&env, InsuranceError::StreamAlreadyCompleted);
         }
 
         let now = env.ledger().timestamp();
@@ -4393,7 +5044,7 @@ impl TipJarContract {
         stream.status = StreamStatus::Active;
         stream.updated_at = now;
 
-        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+        env.storage().persistent().set(&DataKey::Stream(StreamKey::Record(stream_id)), &stream);
 
         env.events().publish(
             (symbol_short!("strm_sta"),),
@@ -4412,19 +5063,19 @@ impl TipJarContract {
         let mut stream: Stream = env
             .storage()
             .persistent()
-            .get(&DataKey::Stream(stream_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+            .get(&DataKey::Stream(StreamKey::Record(stream_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::StreamNotFound));
 
         if stream.sender != sender {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
 
         if stream.status != StreamStatus::Active {
-            panic_with_error!(&env, TipJarError::StreamNotStarted);
+            panic_with_error!(&env, InsuranceError::StreamNotStarted);
         }
 
         if stream.status == StreamStatus::Cancelled {
-            panic_with_error!(&env, TipJarError::StreamAlreadyCancelled);
+            panic_with_error!(&env, InsuranceError::StreamAlreadyCancelled);
         }
 
         let streamed_amount = Self::calculate_streamed_amount(&env, &stream);
@@ -4432,7 +5083,7 @@ impl TipJarContract {
         stream.withdrawn = streamed_amount;
         stream.updated_at = env.ledger().timestamp();
 
-        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+        env.storage().persistent().set(&DataKey::Stream(StreamKey::Record(stream_id)), &stream);
 
         env.events().publish(
             (symbol_short!("strm_sto"),),
@@ -4451,21 +5102,21 @@ impl TipJarContract {
         let mut stream: Stream = env
             .storage()
             .persistent()
-            .get(&DataKey::Stream(stream_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+            .get(&DataKey::Stream(StreamKey::Record(stream_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::StreamNotFound));
 
         if stream.creator != creator {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
 
         if stream.status == StreamStatus::Cancelled {
-            panic_with_error!(&env, TipJarError::StreamAlreadyCancelled);
+            panic_with_error!(&env, InsuranceError::StreamAlreadyCancelled);
         }
 
         let current_time = env.ledger().timestamp();
 
         if current_time < stream.start_time {
-            panic_with_error!(&env, TipJarError::StreamNotStarted);
+            panic_with_error!(&env, InsuranceError::StreamNotStarted);
         }
 
         let total_streamable = stream.amount_per_second * (stream.end_time - stream.start_time) as i128;
@@ -4473,7 +5124,7 @@ impl TipJarContract {
         let available_to_withdraw = streamed_amount - stream.withdrawn;
 
         if available_to_withdraw <= 0 {
-            panic_with_error!(&env, TipJarError::NoStreamedAmount);
+            panic_with_error!(&env, AuctionError::NoStreamedAmount);
         }
 
         // Update stream state BEFORE external call
@@ -4486,7 +5137,7 @@ impl TipJarContract {
 
         stream.updated_at = current_time;
 
-        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+        env.storage().persistent().set(&DataKey::Stream(StreamKey::Record(stream_id)), &stream);
 
         // Transfer tokens to creator
         token::Client::new(&env, &stream.token).transfer(
@@ -4512,19 +5163,19 @@ impl TipJarContract {
         let mut stream: Stream = env
             .storage()
             .persistent()
-            .get(&DataKey::Stream(stream_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+            .get(&DataKey::Stream(StreamKey::Record(stream_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::StreamNotFound));
 
         if stream.sender != sender {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
 
         if stream.status == StreamStatus::Cancelled {
-            panic_with_error!(&env, TipJarError::StreamAlreadyCancelled);
+            panic_with_error!(&env, InsuranceError::StreamAlreadyCancelled);
         }
 
         if stream.status == StreamStatus::Completed {
-            panic_with_error!(&env, TipJarError::StreamAlreadyCompleted);
+            panic_with_error!(&env, InsuranceError::StreamAlreadyCompleted);
         }
 
         let current_time = env.ledger().timestamp();
@@ -4538,7 +5189,7 @@ impl TipJarContract {
         stream.status = StreamStatus::Cancelled;
         stream.updated_at = current_time;
 
-        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+        env.storage().persistent().set(&DataKey::Stream(StreamKey::Record(stream_id)), &stream);
 
         // Refund remaining tokens to sender
         if remaining_amount > 0 {
@@ -4560,14 +5211,14 @@ impl TipJarContract {
 
     /// Returns the current stream details.
     pub fn get_stream(env: Env, stream_id: u64) -> Option<Stream> {
-        env.storage().persistent().get(&DataKey::Stream(stream_id))
+        env.storage().persistent().get(&DataKey::Stream(StreamKey::Record(stream_id)))
     }
 
     /// Returns all stream IDs for a creator.
     pub fn get_streams_by_creator(env: Env, creator: Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::CreatorStreams(creator))
+            .get(&DataKey::Stream(StreamKey::CreatorStreams(creator)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -4575,7 +5226,7 @@ impl TipJarContract {
     pub fn get_streams_by_sender(env: Env, sender: Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::SenderStreams(sender))
+            .get(&DataKey::Stream(StreamKey::SenderStreams(sender)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -4584,8 +5235,8 @@ impl TipJarContract {
         let stream: Stream = env
             .storage()
             .persistent()
-            .get(&DataKey::Stream(stream_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+            .get(&DataKey::Stream(StreamKey::Record(stream_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::StreamNotFound));
 
         Self::calculate_streamed_amount(&env, &stream)
     }
@@ -4595,8 +5246,8 @@ impl TipJarContract {
         let stream: Stream = env
             .storage()
             .persistent()
-            .get(&DataKey::Stream(stream_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::StreamNotFound));
+            .get(&DataKey::Stream(StreamKey::Record(stream_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::StreamNotFound));
 
         if stream.status == StreamStatus::Cancelled || stream.status == StreamStatus::Completed {
             return 0;
@@ -4636,13 +5287,13 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::InvalidAmount);
         }
         if premium_rate_bps > 500 {
-            panic_with_error!(&env, TipJarError::FeeExceedsMaximum);
+            panic_with_error!(&env, FeatureError::FeeExceedsMaximum);
         }
         if payout_ratio_bps > 10000 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
         }
         if tip_premium_bps > 1000 {
-            panic_with_error!(&env, TipJarError::FeeExceedsMaximum);
+            panic_with_error!(&env, FeatureError::FeeExceedsMaximum);
         }
 
         let config = InsurancePoolConfig {
@@ -4654,7 +5305,7 @@ impl TipJarContract {
             admin_fee_bps,
             tip_premium_bps,
         };
-        env.storage().instance().set(&DataKey::InsPoolCfg, &config);
+        env.storage().instance().set(&DataKey::Insurance(InsuranceKey::Cfg), &config);
 
         env.events().publish(
             (symbol_short!("ins_cfg"),),
@@ -4671,7 +5322,7 @@ impl TipJarContract {
         if admin != stored_admin {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::InsEnabled, &enabled);
+        env.storage().instance().set(&DataKey::Insurance(InsuranceKey::Enabled), &enabled);
         env.events().publish((symbol_short!("ins_en"),), enabled);
     }
 
@@ -4687,7 +5338,7 @@ impl TipJarContract {
         if max_claims == 0 {
             panic_with_error!(&env, TipJarError::InvalidAmount);
         }
-        env.storage().instance().set(&DataKey::InsMaxClms, &max_claims);
+        env.storage().instance().set(&DataKey::Insurance(InsuranceKey::MaxClms), &max_claims);
         env.events().publish((symbol_short!("ins_max"),), max_claims);
     }
 
@@ -4700,7 +5351,7 @@ impl TipJarContract {
         if admin != stored_admin {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::InsAdmin, &insurance_admin);
+        env.storage().instance().set(&DataKey::Insurance(InsuranceKey::Admin), &insurance_admin);
         env.events().publish((symbol_short!("ins_adm"),), insurance_admin);
     }
 
@@ -4720,22 +5371,22 @@ impl TipJarContract {
         creator.require_auth();
 
         // Check if insurance is enabled
-        let enabled: bool = env.storage().instance().get(&DataKey::InsEnabled).unwrap_or(true);
+        let enabled: bool = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Enabled)).unwrap_or(true);
         if !enabled {
-            panic_with_error!(&env, TipJarError::InsuranceDisabled);
+            panic_with_error!(&env, InsuranceError::InsuranceDisabled);
         }
 
         let config: InsurancePoolConfig = env
             .storage()
             .instance()
-            .get(&DataKey::InsPoolCfg)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::InsPoolNotCfg));
+            .get(&DataKey::Insurance(InsuranceKey::Cfg))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::InsPoolNotCfg));
 
         if amount < config.min_contribution {
-            panic_with_error!(&env, TipJarError::ContributionTooLow);
+            panic_with_error!(&env, InsuranceError::ContributionTooLow);
         }
         if amount > config.max_contribution {
-            panic_with_error!(&env, TipJarError::ContributionTooHigh);
+            panic_with_error!(&env, InsuranceError::ContributionTooHigh);
         }
 
         // Check whitelist
@@ -4755,7 +5406,7 @@ impl TipJarContract {
         let premium_amount = (amount * config.premium_rate_bps as i128) / 10_000;
 
         // Update pool state
-        let pool_key = DataKey::InsPoolToken(token.clone());
+        let pool_key = DataKey::Insurance(InsuranceKey::Token(token.clone()));
         let mut pool: InsurancePool = env
             .storage()
             .persistent()
@@ -4775,7 +5426,7 @@ impl TipJarContract {
         env.storage().persistent().set(&pool_key, &pool);
 
         // Update creator contribution
-        let contrib_key = DataKey::InsContrib(creator.clone(), token.clone());
+        let contrib_key = DataKey::Insurance(InsuranceKey::Contrib(creator.clone(), token.clone()));
         let current_contrib: i128 = env.storage().persistent().get(&contrib_key).unwrap_or(0);
         env.storage().persistent().set(&contrib_key, &(current_contrib + amount));
 
@@ -4789,7 +5440,7 @@ impl TipJarContract {
 
         // Calculate and add to platform fee balance
         if premium_amount > 0 {
-            let fee_key = DataKey::PlatformFeeBalance(token.clone());
+            let fee_key = DataKey::Fee(FeeKey::Balance(token.clone()));
             let current_fee: i128 = env.storage().instance().get(&fee_key).unwrap_or(0);
             env.storage().instance().set(&fee_key, &(current_fee + premium_amount));
         }
@@ -4818,63 +5469,63 @@ impl TipJarContract {
         creator.require_auth();
 
         if amount <= 0 {
-            panic_with_error!(&env, TipJarError::InvalidClaimAmount);
+            panic_with_error!(&env, InsuranceError::InvalidClaimAmount);
         }
 
         // Check if insurance is enabled
-        let enabled: bool = env.storage().instance().get(&DataKey::InsEnabled).unwrap_or(true);
+        let enabled: bool = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Enabled)).unwrap_or(true);
         if !enabled {
-            panic_with_error!(&env, TipJarError::InsuranceDisabled);
+            panic_with_error!(&env, InsuranceError::InsuranceDisabled);
         }
 
         // Check if pool is configured
         let config: InsurancePoolConfig = env
             .storage()
             .instance()
-            .get(&DataKey::InsPoolCfg)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::InsPoolNotCfg));
+            .get(&DataKey::Insurance(InsuranceKey::Cfg))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::InsPoolNotCfg));
 
         // Check creator has coverage
         let max_payout = Self::insurance_get_coverage(env.clone(), creator.clone(), token.clone());
         if max_payout <= 0 {
-            panic_with_error!(&env, TipJarError::NoCoverage);
+            panic_with_error!(&env, InsuranceError::NoCoverage);
         }
 
         // Check active claim limit
-        let max_active: u32 = env.storage().instance().get(&DataKey::InsMaxClms).unwrap_or(3);
-        let active_key = DataKey::InsActiveClms(creator.clone(), token.clone());
+        let max_active: u32 = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::MaxClms)).unwrap_or(3);
+        let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(creator.clone(), token.clone()));
         let active_claims: u32 = env.storage().persistent().get(&active_key).unwrap_or(0);
         if active_claims >= max_active {
-            panic_with_error!(&env, TipJarError::TooManyActiveClaims);
+            panic_with_error!(&env, InsuranceError::TooManyActiveClaims);
         }
 
         // Check last claim cooldown
-        let last_claim_key = DataKey::InsLastClm(creator.clone(), token.clone());
+        let last_claim_key = DataKey::Insurance(InsuranceKey::LastClm(creator.clone(), token.clone()));
         let last_claim: u64 = env.storage().persistent().get(&last_claim_key).unwrap_or(0);
         let now = env.ledger().timestamp();
         if last_claim > 0 && now < last_claim + config.claim_cooldown {
-            panic_with_error!(&env, TipJarError::ClaimCooldownActive);
+            panic_with_error!(&env, InsuranceError::ClaimCooldownActive);
         }
 
         // Check pool has sufficient reserves
-        let pool_key = DataKey::InsPoolToken(token.clone());
+        let pool_key = DataKey::Insurance(InsuranceKey::Token(token.clone()));
         let pool: InsurancePool = env
             .storage()
             .persistent()
             .get(&pool_key)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::InsufficientReserves));
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::InsufficientReserves));
 
         if amount > max_payout {
-            panic_with_error!(&env, TipJarError::PayoutExceedsReserves);
+            panic_with_error!(&env, InsuranceError::PayoutExceedsReserves);
         }
 
         if amount > pool.total_reserves {
-            panic_with_error!(&env, TipJarError::InsufficientReserves);
+            panic_with_error!(&env, InsuranceError::InsufficientReserves);
         }
 
         // Create claim
-        let claim_id: u64 = env.storage().instance().get(&DataKey::InsClaimCtr).unwrap_or(0);
-        env.storage().instance().set(&DataKey::InsClaimCtr, &(claim_id + 1));
+        let claim_id: u64 = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Ctr)).unwrap_or(0);
+        env.storage().instance().set(&DataKey::Insurance(InsuranceKey::Ctr), &(claim_id + 1));
 
         let claim = InsuranceClaim {
             claim_id,
@@ -4887,10 +5538,10 @@ impl TipJarContract {
             updated_at: now,
             last_claim_at: last_claim,
         };
-        env.storage().persistent().set(&DataKey::InsClaim(claim_id), &claim);
+        env.storage().persistent().set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
 
         // Add to creator's claims list
-        let creator_claims_key = DataKey::InsClms(creator.clone(), token.clone());
+        let creator_claims_key = DataKey::Insurance(InsuranceKey::Clms(creator.clone(), token.clone()));
         let mut creator_claims: Vec<u64> = env.storage().persistent().get(&creator_claims_key).unwrap_or_else(|| Vec::new(&env));
         creator_claims.push_back(claim_id);
         env.storage().persistent().set(&creator_claims_key, &creator_claims);
@@ -4899,7 +5550,7 @@ impl TipJarContract {
         env.storage().persistent().set(&active_key, &(active_claims + 1));
 
         // Update total claims count
-        let total_claims_key = DataKey::InsTotalClms(creator.clone(), token.clone());
+        let total_claims_key = DataKey::Insurance(InsuranceKey::TotalClms(creator.clone(), token.clone()));
         let total_claims: u32 = env.storage().persistent().get(&total_claims_key).unwrap_or(0);
         env.storage().persistent().set(&total_claims_key, &(total_claims + 1));
 
@@ -4932,35 +5583,35 @@ impl TipJarContract {
 
         // Check if caller is admin or insurance admin
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        let insurance_admin: Address = env.storage().instance().get(&DataKey::InsAdmin).unwrap_or(stored_admin.clone());
+        let insurance_admin: Address = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Admin)).unwrap_or(stored_admin.clone());
         if approver != stored_admin && approver != insurance_admin {
-            panic_with_error!(&env, TipJarError::AdmAppReq);
+            panic_with_error!(&env, InsuranceError::AdmAppReq);
         }
 
         let claim: InsuranceClaim = env
             .storage()
             .persistent()
-            .get(&DataKey::InsClaim(claim_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::ClaimNotFound));
+            .get(&DataKey::Insurance(InsuranceKey::Claim(claim_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::ClaimNotFound));
 
         if claim.status != ClaimStatus::Pending {
-            panic_with_error!(&env, TipJarError::ClaimNotApproved);
+            panic_with_error!(&env, InsuranceError::ClaimNotApproved);
         }
 
         let mut updated_claim = claim.clone();
         updated_claim.status = ClaimStatus::Approved;
         updated_claim.updated_at = env.ledger().timestamp();
-        env.storage().persistent().set(&DataKey::InsClaim(claim_id), &updated_claim);
+        env.storage().persistent().set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
 
         // Update pool
-        let pool_key = DataKey::InsPoolToken(claim.token.clone());
+        let pool_key = DataKey::Insurance(InsuranceKey::Token(claim.token.clone()));
         let pool: InsurancePool = env.storage().persistent().get(&pool_key).unwrap();
         let mut updated_pool = pool.clone();
         updated_pool.active_claims -= 1;
         env.storage().persistent().set(&pool_key, &updated_pool);
 
         // Update creator active claims
-        let active_key = DataKey::InsActiveClms(claim.creator.clone(), claim.token.clone());
+        let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(claim.creator.clone(), claim.token.clone()));
         let active_claims: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
         env.storage().persistent().set(&active_key, &(active_claims - 1));
 
@@ -4984,36 +5635,36 @@ impl TipJarContract {
 
         // Check if caller is admin or insurance admin
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        let insurance_admin: Address = env.storage().instance().get(&DataKey::InsAdmin).unwrap_or(stored_admin.clone());
+        let insurance_admin: Address = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Admin)).unwrap_or(stored_admin.clone());
         if rejector != stored_admin && rejector != insurance_admin {
-            panic_with_error!(&env, TipJarError::AdmAppReq);
+            panic_with_error!(&env, InsuranceError::AdmAppReq);
         }
 
         let claim: InsuranceClaim = env
             .storage()
             .persistent()
-            .get(&DataKey::InsClaim(claim_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::ClaimNotFound));
+            .get(&DataKey::Insurance(InsuranceKey::Claim(claim_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::ClaimNotFound));
 
         if claim.status != ClaimStatus::Pending && claim.status != ClaimStatus::Approved {
-            panic_with_error!(&env, TipJarError::ClaimNotApproved);
+            panic_with_error!(&env, InsuranceError::ClaimNotApproved);
         }
 
         let mut updated_claim = claim.clone();
         updated_claim.status = ClaimStatus::Rejected;
         updated_claim.updated_at = env.ledger().timestamp();
-        env.storage().persistent().set(&DataKey::InsClaim(claim_id), &updated_claim);
+        env.storage().persistent().set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
 
         if claim.status == ClaimStatus::Approved {
             // Update pool
-            let pool_key = DataKey::InsPoolToken(claim.token.clone());
+            let pool_key = DataKey::Insurance(InsuranceKey::Token(claim.token.clone()));
             let pool: InsurancePool = env.storage().persistent().get(&pool_key).unwrap();
             let mut updated_pool = pool.clone();
             updated_pool.active_claims -= 1;
             env.storage().persistent().set(&pool_key, &updated_pool);
 
             // Update creator active claims
-            let active_key = DataKey::InsActiveClms(claim.creator.clone(), claim.token.clone());
+            let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(claim.creator.clone(), claim.token.clone()));
             let active_claims: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
             env.storage().persistent().set(&active_key, &(active_claims - 1));
         }
@@ -5039,38 +5690,38 @@ impl TipJarContract {
 
         // Check if caller is admin or insurance admin
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        let insurance_admin: Address = env.storage().instance().get(&DataKey::InsAdmin).unwrap_or(stored_admin.clone());
+        let insurance_admin: Address = env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Admin)).unwrap_or(stored_admin.clone());
         if caller != stored_admin && caller != insurance_admin {
-            panic_with_error!(&env, TipJarError::AdmAppReq);
+            panic_with_error!(&env, InsuranceError::AdmAppReq);
         }
 
         let claim: InsuranceClaim = env
             .storage()
             .persistent()
-            .get(&DataKey::InsClaim(claim_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::ClaimNotFound));
+            .get(&DataKey::Insurance(InsuranceKey::Claim(claim_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::ClaimNotFound));
 
         if claim.status != ClaimStatus::Approved {
-            panic_with_error!(&env, TipJarError::ClaimNotApproved);
+            panic_with_error!(&env, InsuranceError::ClaimNotApproved);
         }
 
         // Check pool has sufficient reserves
-        let pool_key = DataKey::InsPoolToken(claim.token.clone());
+        let pool_key = DataKey::Insurance(InsuranceKey::Token(claim.token.clone()));
         let pool: InsurancePool = env
             .storage()
             .persistent()
             .get(&pool_key)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::InsufficientReserves));
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::InsufficientReserves));
 
         if claim.amount > pool.total_reserves {
-            panic_with_error!(&env, TipJarError::InsufficientReserves);
+            panic_with_error!(&env, InsuranceError::InsufficientReserves);
         }
 
         // Update creator's contribution (deduct claim amount)
-        let contrib_key = DataKey::InsContrib(claim.creator.clone(), claim.token.clone());
+        let contrib_key = DataKey::Insurance(InsuranceKey::Contrib(claim.creator.clone(), claim.token.clone()));
         let current_contrib: i128 = env.storage().persistent().get(&contrib_key).unwrap_or(0);
         let new_contrib = current_contrib - claim.amount;
-        env.storage().persistent().set(&contrib_key, &(new_contrib.max(0)));
+        env.storage().persistent().set(&contrib_key, &new_contrib.max(0));
 
         // Update pool reserves
         let mut updated_pool = pool.clone();
@@ -5084,13 +5735,13 @@ impl TipJarContract {
         let mut updated_claim = claim.clone();
         updated_claim.status = ClaimStatus::Paid;
         updated_claim.updated_at = env.ledger().timestamp();
-        env.storage().persistent().set(&DataKey::InsClaim(claim_id), &updated_claim);
+        env.storage().persistent().set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
 
         // Update creator's last claim time and active claims
-        let last_claim_key = DataKey::InsLastClm(claim.creator.clone(), claim.token.clone());
-        env.storage().persistent().set(&last_claim_key, &(env.ledger().timestamp()));
+        let last_claim_key = DataKey::Insurance(InsuranceKey::LastClm(claim.creator.clone(), claim.token.clone()));
+        env.storage().persistent().set(&last_claim_key, &env.ledger().timestamp());
 
-        let active_key = DataKey::InsActiveClms(claim.creator.clone(), claim.token.clone());
+        let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(claim.creator.clone(), claim.token.clone()));
         let active_claims: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
         env.storage().persistent().set(&active_key, &(active_claims - 1));
 
@@ -5111,33 +5762,33 @@ impl TipJarContract {
     pub fn insurance_get_config(env: Env) -> InsurancePoolConfig {
         env.storage()
             .instance()
-            .get(&DataKey::InsPoolCfg)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::InsPoolNotCfg))
+            .get(&DataKey::Insurance(InsuranceKey::Cfg))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::InsPoolNotCfg))
     }
 
     /// Check if the insurance feature is enabled.
     pub fn insurance_is_enabled(env: Env) -> bool {
-        env.storage().instance().get(&DataKey::InsEnabled).unwrap_or(true)
+        env.storage().instance().get(&DataKey::Insurance(InsuranceKey::Enabled)).unwrap_or(true)
     }
 
     /// Get the insurance pool state for a specific token.
     pub fn insurance_get_pool(env: Env, token: Address) -> Option<InsurancePool> {
-        env.storage().persistent().get(&DataKey::InsPoolToken(token))
+        env.storage().persistent().get(&DataKey::Insurance(InsuranceKey::Token(token)))
     }
 
     /// Get a specific insurance claim by ID.
     pub fn insurance_get_claim(env: Env, claim_id: u64) -> InsuranceClaim {
         env.storage()
             .persistent()
-            .get(&DataKey::InsClaim(claim_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::ClaimNotFound))
+            .get(&DataKey::Insurance(InsuranceKey::Claim(claim_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::ClaimNotFound))
     }
 
     /// Get creator's contribution amount for a specific token.
     pub fn insurance_get_contribution(env: Env, creator: Address, token: Address) -> i128 {
         env.storage()
             .persistent()
-            .get(&DataKey::InsContrib(creator, token))
+            .get(&DataKey::Insurance(InsuranceKey::Contrib(creator, token)))
             .unwrap_or(0)
     }
 
@@ -5146,14 +5797,14 @@ impl TipJarContract {
         let config: InsurancePoolConfig = env
             .storage()
             .instance()
-            .get(&DataKey::InsPoolCfg)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::InsPoolNotCfg));
+            .get(&DataKey::Insurance(InsuranceKey::Cfg))
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::InsPoolNotCfg));
 
         // Manual contribution coverage
         let contrib: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::InsContrib(creator.clone(), token.clone()))
+            .get(&DataKey::Insurance(InsuranceKey::Contrib(creator.clone(), token.clone())))
             .unwrap_or(0);
 
         // Automatic premium coverage estimate from tips received
@@ -5175,7 +5826,7 @@ impl TipJarContract {
     pub fn insurance_get_active_claims(env: Env, creator: Address, token: Address) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::InsActiveClms(creator, token))
+            .get(&DataKey::Insurance(InsuranceKey::ActiveClms(creator, token)))
             .unwrap_or(0)
     }
 
@@ -5183,7 +5834,7 @@ impl TipJarContract {
     pub fn insurance_get_total_claims(env: Env, creator: Address, token: Address) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::InsTotalClms(creator, token))
+            .get(&DataKey::Insurance(InsuranceKey::TotalClms(creator, token)))
             .unwrap_or(0)
     }
 
@@ -5192,7 +5843,7 @@ impl TipJarContract {
         let contrib: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::InsContrib(creator, token))
+            .get(&DataKey::Insurance(InsuranceKey::Contrib(creator, token)))
             .unwrap_or(0);
         contrib > 0
     }
@@ -5217,17 +5868,17 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::InvalidAmount);
         }
 
-        let pool_key = DataKey::InsPoolToken(token.clone());
+        let pool_key = DataKey::Insurance(InsuranceKey::Token(token.clone()));
         let pool: InsurancePool = env
             .storage()
             .persistent()
             .get(&pool_key)
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::InsufficientReserves));
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::InsufficientReserves));
 
         // Keep minimum reserve (10% of total contributions)
         let min_reserve = pool.total_contributions / 10;
         if pool.total_reserves - amount < min_reserve {
-            panic_with_error!(&env, TipJarError::InsufficientReserves);
+            panic_with_error!(&env, InsuranceError::InsufficientReserves);
         }
 
         let mut updated_pool = pool.clone();
@@ -5250,13 +5901,13 @@ impl TipJarContract {
     /// Get the insurance admin address.
     pub fn insurance_get_admin(env: Env) -> Address {
         env.storage().instance()
-            .get(&DataKey::InsAdmin)
+            .get(&DataKey::Insurance(InsuranceKey::Admin))
             .unwrap_or_else(|| env.storage().instance().get(&DataKey::Admin).unwrap())
     }
 
     /// Get the maximum active claims per creator.
     pub fn insurance_get_max_active_claims(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::InsMaxClms).unwrap_or(3)
+        env.storage().instance().get(&DataKey::Insurance(InsuranceKey::MaxClms)).unwrap_or(3)
     }
 
     /// Process multiple insurance claims in batch (admin only).
@@ -5283,25 +5934,25 @@ impl TipJarContract {
             let claim: InsuranceClaim = env
                 .storage()
                 .persistent()
-                .get(&DataKey::InsClaim(claim_id))
-                .unwrap_or_else(|| panic_with_error!(&env, TipJarError::ClaimNotFound));
+                .get(&DataKey::Insurance(InsuranceKey::Claim(claim_id)))
+                .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::ClaimNotFound));
 
             if action == String::from_str(&env, "approve") {
                 if claim.status == ClaimStatus::Pending {
                     let mut updated_claim = claim.clone();
                     updated_claim.status = ClaimStatus::Approved;
                     updated_claim.updated_at = env.ledger().timestamp();
-                    env.storage().persistent().set(&DataKey::InsClaim(claim_id), &updated_claim);
+                    env.storage().persistent().set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
 
                     // Update pool active claims
-                    let pool_key = DataKey::InsPoolToken(claim.token.clone());
+                    let pool_key = DataKey::Insurance(InsuranceKey::Token(claim.token.clone()));
                     let pool: InsurancePool = env.storage().persistent().get(&pool_key).unwrap();
                     let mut updated_pool = pool.clone();
                     updated_pool.active_claims -= 1;
                     env.storage().persistent().set(&pool_key, &updated_pool);
 
                     // Update creator active claims
-                    let active_key = DataKey::InsActiveClms(claim.creator.clone(), claim.token.clone());
+                    let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(claim.creator.clone(), claim.token.clone()));
                     let active_claims: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
                     env.storage().persistent().set(&active_key, &(active_claims - 1));
 
@@ -5309,7 +5960,7 @@ impl TipJarContract {
                 }
             } else if action == String::from_str(&env, "pay") {
                 if claim.status == ClaimStatus::Approved {
-                    let pool_key = DataKey::InsPoolToken(claim.token.clone());
+                    let pool_key = DataKey::Insurance(InsuranceKey::Token(claim.token.clone()));
                     let pool: InsurancePool = env.storage().persistent().get(&pool_key).unwrap();
 
                     if claim.amount <= pool.total_reserves {
@@ -5323,14 +5974,14 @@ impl TipJarContract {
                         let mut updated_claim = claim.clone();
                         updated_claim.status = ClaimStatus::Paid;
                         updated_claim.updated_at = env.ledger().timestamp();
-                        env.storage().persistent().set(&DataKey::InsClaim(claim_id), &updated_claim);
+                        env.storage().persistent().set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
 
                         // Update creator last claim time
-                        let last_claim_key = DataKey::InsLastClm(claim.creator.clone(), claim.token.clone());
-                        env.storage().persistent().set(&last_claim_key, &(env.ledger().timestamp()));
+                        let last_claim_key = DataKey::Insurance(InsuranceKey::LastClm(claim.creator.clone(), claim.token.clone()));
+                        env.storage().persistent().set(&last_claim_key, &env.ledger().timestamp());
 
                         // Update creator active claims
-                        let active_key = DataKey::InsActiveClms(claim.creator.clone(), claim.token.clone());
+                        let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(claim.creator.clone(), claim.token.clone()));
                         let active_claims: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
                         env.storage().persistent().set(&active_key, &(active_claims - 1));
 
@@ -5363,7 +6014,7 @@ impl TipJarContract {
     ) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::InsClms(creator, token))
+            .get(&DataKey::Insurance(InsuranceKey::Clms(creator, token)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -5378,9 +6029,9 @@ impl TipJarContract {
         if admin != stored_admin {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::BridgeRelayer, &relayer);
-        env.storage().instance().set(&DataKey::BridgeToken, &token);
-        env.storage().instance().set(&DataKey::BridgeEnabled, &true);
+        env.storage().instance().set(&DataKey::Bridge(BridgeKey::Relayer), &relayer);
+        env.storage().instance().set(&DataKey::Bridge(BridgeKey::Token), &token);
+        env.storage().instance().set(&DataKey::Bridge(BridgeKey::Enabled), &true);
         env.events().publish(
             (symbol_short!("br_cfg"),),
             (relayer, token),
@@ -5410,9 +6061,9 @@ impl TipJarContract {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
         if fee_bps > 500 {
-            panic_with_error!(&env, TipJarError::InvalidBridgeFee);
+            panic_with_error!(&env, AuctionError::InvalidBridgeFee);
         }
-        env.storage().instance().set(&DataKey::BridgeFeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::Bridge(BridgeKey::FeeBps), &fee_bps);
         env.events().publish((symbol_short!("br_fee"),), fee_bps);
     }
 
@@ -5420,7 +6071,7 @@ impl TipJarContract {
     pub fn get_bridge_fee(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::BridgeFeeBps)
+            .get(&DataKey::Bridge(BridgeKey::FeeBps))
             .unwrap_or(0)
     }
 
@@ -5433,7 +6084,7 @@ impl TipJarContract {
         if admin != stored_admin {
             panic_with_error!(&env, TipJarError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::BridgeEnabled, &enabled);
+        env.storage().instance().set(&DataKey::Bridge(BridgeKey::Enabled), &enabled);
         env.events().publish((symbol_short!("br_en"),), enabled);
     }
 
@@ -5441,7 +6092,7 @@ impl TipJarContract {
     pub fn is_bridge_enabled(env: Env) -> bool {
         env.storage()
             .instance()
-            .get(&DataKey::BridgeEnabled)
+            .get(&DataKey::Bridge(BridgeKey::Enabled))
             .unwrap_or(false)
     }
 
@@ -5466,11 +6117,11 @@ impl TipJarContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::OptionPricingParams, &params);
+            .set(&DataKey::Option(OptionKey::PricingParams), &params);
         
         env.storage()
             .instance()
-            .set(&DataKey::OptionCounter, &0u64);
+            .set(&DataKey::Option(OptionKey::Ctr), &0u64);
 
         env.events().publish((symbol_short!("opt_init"),), ());
     }
@@ -5494,12 +6145,12 @@ impl TipJarContract {
 
         // Validate inputs
         if strike_price <= 0 || amount <= 0 {
-            panic_with_error!(&env, TipJarError::InvalidOptionParams);
+            panic_with_error!(&env, AuctionError::InvalidOptionParams);
         }
 
         let now = env.ledger().timestamp();
         if expiration <= now {
-            panic_with_error!(&env, TipJarError::InvalidOptionParams);
+            panic_with_error!(&env, AuctionError::InvalidOptionParams);
         }
 
         // Check token is whitelisted
@@ -5516,8 +6167,8 @@ impl TipJarContract {
         let collateral = options::calculate_collateral(option_type, strike_price, amount);
 
         // Generate option ID
-        let option_id: u64 = env.storage().instance().get(&DataKey::OptionCounter).unwrap_or(0);
-        env.storage().instance().set(&DataKey::OptionCounter, &(option_id + 1));
+        let option_id: u64 = env.storage().instance().get(&DataKey::Option(OptionKey::Ctr)).unwrap_or(0);
+        env.storage().instance().set(&DataKey::Option(OptionKey::Ctr), &(option_id + 1));
 
         // Create option contract
         let option = options::OptionContract {
@@ -5545,7 +6196,7 @@ impl TipJarContract {
         // Update storage
         env.storage()
             .persistent()
-            .set(&DataKey::Option(option_id), &option);
+            .set(&DataKey::Option(OptionKey::Record(option_id)), &option);
         
         options::add_written_option(&env, &writer, option_id);
         options::add_active_option(&env, option_id);
@@ -5585,21 +6236,21 @@ impl TipJarContract {
         let mut option: options::OptionContract = env
             .storage()
             .persistent()
-            .get(&DataKey::Option(option_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TipJarError::OptionNotFound));
+            .get(&DataKey::Option(OptionKey::Record(option_id)))
+            .unwrap_or_else(|| panic_with_error!(&env, AuctionError::OptionNotFound));
 
         // Verify option is available
         if option.holder.is_some() {
-            panic_with_error!(&env, TipJarError::OptionAlreadySold);
+            panic_with_error!(&env, AuctionError::OptionAlreadySold);
         }
 
         if option.status != options::OptionStatus::Active {
-            panic_with_error!(&env, TipJarError::OptionNotActive);
+            panic_with_error!(&env, AuctionError::OptionNotActive);
         }
 
         let now = env.ledger().timestamp();
         if now >= option.expiration {
-            panic_with_error!(&env, TipJarError::OptionExpired);
+            panic_with_error!(&env, AuctionError::OptionExpired);
         }
 
         // Calculate premium
@@ -5627,7 +6278,7 @@ impl TipJarContract {
         option.premium = premium;
         env.storage()
             .persistent()
-            .set(&DataKey::Option(option_id), &option);
+            .set(&DataKey::Option(OptionKey::Record(option_id)), &option);
 
         // Update positions
         let mut writer_position = options::get_position(&env, &option.writer);
@@ -5710,7 +6361,7 @@ impl TipJarContract {
     pub fn get_written_options(env: Env, writer: Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::WrittenOptions(writer))
+            .get(&DataKey::Option(OptionKey::Written(writer)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -5718,7 +6369,7 @@ impl TipJarContract {
     pub fn get_held_options(env: Env, holder: Address) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::HeldOptions(holder))
+            .get(&DataKey::Option(OptionKey::Held(holder)))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -5731,7 +6382,7 @@ impl TipJarContract {
     pub fn get_active_options(env: Env) -> Vec<u64> {
         env.storage()
             .persistent()
-            .get(&DataKey::ActiveOptions)
+            .get(&DataKey::Option(OptionKey::Active))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -5790,7 +6441,7 @@ impl TipJarContract {
     /// Useful for cleaning up expired options. Returns count of expired options.
     /// Emits `("opt_bexp",)` with data `expired_count`.
     pub fn batch_expire_options(env: Env, option_ids: Vec<u64>) -> u32 {
-        let mut ids_vec: soroban_sdk::vec::Vec<u64> = soroban_sdk::vec::Vec::new(&env);
+        let mut ids_vec: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
         for i in 0..option_ids.len() {
             ids_vec.push_back(option_ids.get(i).unwrap());
         }
@@ -6002,7 +6653,7 @@ impl TipJarContract {
     ///
     /// # Returns
     /// - Current collateralization ratio in basis points
-    pub fn get_synthetic_collateralization_ratio(env: Env, asset_id: u64) -> u32 {
+    pub fn get_synth_collateral_ratio(env: Env, asset_id: u64) -> u32 {
         synthetic::queries::get_synthetic_collateralization_ratio(&env, asset_id)
             .unwrap_or_else(|e| panic_with_error!(&env, e))
     }
@@ -6045,3 +6696,50 @@ impl TipJarContract {
         synthetic::queries::get_holder_balance(&env, asset_id, &holder)
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
