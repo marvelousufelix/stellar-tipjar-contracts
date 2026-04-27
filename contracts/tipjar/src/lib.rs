@@ -8306,6 +8306,98 @@ a
     pub fn qf_get_match_estimate(env: Env, round_id: u64, project: Address) -> i128 {
         quadratic_funding::get_match_estimate(&env, round_id, &project)
     }
+
+    // ── Conviction Voting ────────────────────────────────────────────────────
+
+    /// Initialize conviction voting system with default configuration.
+    pub fn init_conviction_voting(env: Env) {
+        governance::conviction::init_conviction_voting(&env);
+    }
+
+    /// Cast a conviction vote on a proposal.
+    /// Voting power accumulates over time based on lock duration.
+    /// Emits `("conv_vote",)` with data `(voter, proposal_id, effective_voting_power)`.
+    pub fn cast_conviction_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        choice: governance::VoteChoice,
+        base_voting_power: i128,
+    ) {
+        governance::conviction_integration::cast_conviction_vote(
+            &env,
+            &voter,
+            proposal_id,
+            choice,
+            base_voting_power,
+        );
+    }
+
+    /// Change an existing conviction vote (e.g., increase voting power).
+    /// Applies decay penalty to accumulated conviction.
+    /// Emits `("conv_chg",)` with data `(voter, proposal_id, new_effective_voting_power)`.
+    pub fn change_conviction_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        new_choice: governance::VoteChoice,
+        new_base_voting_power: i128,
+    ) {
+        governance::conviction_integration::change_conviction_vote(
+            &env,
+            &voter,
+            proposal_id,
+            new_choice,
+            new_base_voting_power,
+        );
+    }
+
+    /// Get effective voting power for a voter on a proposal (includes conviction multiplier).
+    pub fn get_conviction_voting_power(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> i128 {
+        governance::conviction_integration::get_effective_voting_power(&env, proposal_id, &voter)
+    }
+
+    /// Get detailed conviction voting information for a voter on a proposal.
+    pub fn get_conviction_voting_details(
+        env: Env,
+        proposal_id: u64,
+        voter: Address,
+    ) -> Option<governance::conviction_integration::ConvictionVotingDetails> {
+        governance::conviction_integration::get_conviction_voting_details(&env, proposal_id, &voter)
+    }
+
+    /// Get total conviction accumulated by a voter across all proposals.
+    pub fn get_voter_total_conviction(env: Env, voter: Address) -> i128 {
+        governance::conviction::get_voter_total_conviction(&env, &voter)
+    }
+
+    /// Get current conviction voting configuration.
+    pub fn get_conviction_config(env: Env) -> governance::conviction::ConvictionConfig {
+        governance::conviction::get_conviction_config(&env)
+    }
+
+    /// Update conviction voting configuration (admin only).
+    pub fn update_conviction_config(
+        env: Env,
+        config: governance::conviction::ConvictionConfig,
+    ) {
+        Self::require_admin(&env);
+        governance::conviction::update_conviction_config(&env, &config);
+    }
+
+    /// Check if voter can create a proposal based on conviction voting.
+    pub fn can_create_proposal_with_conviction(env: Env, voter: Address) -> bool {
+        governance::conviction_integration::can_create_proposal_with_conviction(&env, &voter)
+    }
+
+    /// Get proposal threshold adjusted by voter's conviction.
+    pub fn get_adjusted_proposal_threshold(env: Env, voter: Address) -> i128 {
+        governance::conviction_integration::get_adjusted_proposal_threshold(&env, &voter)
+    }
 }
 
 
