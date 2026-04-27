@@ -76,6 +76,9 @@ pub mod quadratic_funding;
 // TWAP oracle
 pub mod twap_oracle;
 
+// Threshold signatures
+pub mod threshold_sig;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -838,6 +841,14 @@ pub enum DataKey {
     EncryptedTipCounter,
     /// Nullifier for encrypted tips (prevents double-spend).
     PrivacyNullifier(BytesN<32>),
+    /// Threshold policy record keyed by policy_id.
+    ThresholdPolicy(u64),
+    /// Global counter for threshold policy IDs.
+    ThresholdPolicyCtr,
+    /// Threshold tip record keyed by tip_id.
+    ThresholdTip(u64),
+    /// Global counter for threshold tip IDs.
+    ThresholdTipCtr,
 }
 
 #[contracterror]
@@ -1099,6 +1110,30 @@ pub enum OtherError {
     ActiveLoanExists = 110,
     InsufficientLendingLiquidity = 111,
     NoActiveCredit = 112,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ThresholdError {
+    /// No policy exists with the given ID.
+    PolicyNotFound = 300,
+    /// Threshold must be >= 1 and <= number of signers.
+    InvalidThreshold = 301,
+    /// Signer list must have at least one entry.
+    EmptySigner = 302,
+    /// No pending tip exists with the given ID.
+    TipNotFound = 303,
+    /// Tip is not in Pending status.
+    TipNotPending = 304,
+    /// Caller is not an authorised signer for this policy.
+    NotASigner = 305,
+    /// Caller has already submitted a partial signature for this tip.
+    AlreadySigned = 306,
+    /// Tip has not yet reached the required threshold.
+    ThresholdNotMet = 307,
+    /// Only the proposer may cancel this tip.
+    Unauthorized = 308,
 }
 
 
@@ -8444,6 +8479,301 @@ a
     /// Get proposal threshold adjusted by voter's conviction.
     pub fn get_adjusted_proposal_threshold(env: Env, voter: Address) -> i128 {
         governance::conviction_integration::get_adjusted_proposal_threshold(&env, &voter)
+    }
+
+    // ── threshold signatures ─────────────────────────────────────────────────
+
+    /// Creates a threshold policy defining which signers can co-authorize tips.
+    ///
+    /// `threshold` must be >= 1 and <= `signers.len()`.
+    /// Returns the new policy ID.
+    /// Emits `("ts_policy",)` with data `(policy_id, owner, threshold)`.
+    pub fn create_threshold_policy(
+        env: Env,
+        owner: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        owner.require_auth();
+
+        if signers.is_empty() {
+            panic_with_error!(&env, ThresholdError::EmptySigner);
+        }
+        if threshold == 0 || threshold > signers.len() {
+            panic_with_error!(&env, ThresholdError::InvalidThreshold);
+        }
+
+        let policy_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ThresholdPolicyCtr)
+            .unwrap_or(0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::ThresholdPolicyCtr, &(policy_id + 1));
+
+        let policy = threshold_sig::ThresholdPolicy {
+            policy_id,
+            owner: owner.clone(),
+            signers,
+            threshold,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ThresholdPolicy(policy_id), &policy);
+
+        env.events().publish(
+            (symbol_short!("ts_pol"),),
+            (policy_id, owner, threshold),
+        );
+        policy_id
+    }
+
+    /// Proposes a tip that requires threshold authorization before execution.
+    ///
+    /// The proposer must be one of the policy's signers. Their signature is
+    /// counted immediately. Returns the new tip ID.
+    /// Emits `("ts_prop",)` with data `(tip_id, policy_id, creator, amount)`.
+    pub fn propose_threshold_tip(
+        env: Env,
+        proposer: Address,
+        policy_id: u64,
+        creator: Address,
+        token: Address,
+        amount: i128,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        proposer.require_auth();
+
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        let policy: threshold_sig::ThresholdPolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdPolicy(policy_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ThresholdError::PolicyNotFound));
+
+        if !threshold_sig::is_signer(&policy.signers, &proposer) {
+            panic_with_error!(&env, ThresholdError::NotASigner);
+        }
+
+        let tip_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ThresholdTipCtr)
+            .unwrap_or(0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::ThresholdTipCtr, &(tip_id + 1));
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+
+        let status = if threshold_sig::is_approved(
+            &threshold_sig::ThresholdTip {
+                tip_id,
+                policy_id,
+                proposer: proposer.clone(),
+                creator: creator.clone(),
+                token: token.clone(),
+                amount,
+                approvals: approvals.clone(),
+                status: threshold_sig::ThresholdTipStatus::Pending,
+                created_at: env.ledger().timestamp(),
+            },
+            policy.threshold,
+        ) {
+            threshold_sig::ThresholdTipStatus::Approved
+        } else {
+            threshold_sig::ThresholdTipStatus::Pending
+        };
+
+        let tip = threshold_sig::ThresholdTip {
+            tip_id,
+            policy_id,
+            proposer: proposer.clone(),
+            creator: creator.clone(),
+            token: token.clone(),
+            amount,
+            approvals,
+            status,
+            created_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ThresholdTip(tip_id), &tip);
+
+        env.events().publish(
+            (symbol_short!("ts_prop"),),
+            (tip_id, policy_id, creator, amount),
+        );
+        tip_id
+    }
+
+    /// Submits a partial signature (approval) for a pending threshold tip.
+    ///
+    /// Once the required threshold is reached the tip status becomes `Approved`.
+    /// Emits `("ts_sig",)` with data `(tip_id, signer, approvals_count)`.
+    pub fn submit_partial_sig(env: Env, signer: Address, tip_id: u64) {
+        Self::require_not_paused(&env);
+        signer.require_auth();
+
+        let mut tip: threshold_sig::ThresholdTip = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdTip(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ThresholdError::TipNotFound));
+
+        if tip.status != threshold_sig::ThresholdTipStatus::Pending {
+            panic_with_error!(&env, ThresholdError::TipNotPending);
+        }
+
+        let policy: threshold_sig::ThresholdPolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdPolicy(tip.policy_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ThresholdError::PolicyNotFound));
+
+        if !threshold_sig::is_signer(&policy.signers, &signer) {
+            panic_with_error!(&env, ThresholdError::NotASigner);
+        }
+        if tip.approvals.contains(&signer) {
+            panic_with_error!(&env, ThresholdError::AlreadySigned);
+        }
+
+        tip.approvals.push_back(signer.clone());
+        let count = tip.approvals.len();
+
+        if threshold_sig::is_approved(&tip, policy.threshold) {
+            tip.status = threshold_sig::ThresholdTipStatus::Approved;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ThresholdTip(tip_id), &tip);
+
+        env.events().publish(
+            (symbol_short!("ts_sig"),),
+            (tip_id, signer, count),
+        );
+    }
+
+    /// Executes an approved threshold tip, transferring tokens to the creator.
+    ///
+    /// Any signer may trigger execution once the tip is `Approved`.
+    /// Emits `("ts_exec",)` with data `(tip_id, creator, amount)`.
+    pub fn execute_threshold_tip(env: Env, caller: Address, tip_id: u64) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut tip: threshold_sig::ThresholdTip = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdTip(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ThresholdError::TipNotFound));
+
+        if tip.status == threshold_sig::ThresholdTipStatus::Pending {
+            panic_with_error!(&env, ThresholdError::ThresholdNotMet);
+        }
+        if tip.status != threshold_sig::ThresholdTipStatus::Approved {
+            panic_with_error!(&env, ThresholdError::TipNotPending);
+        }
+
+        let policy: threshold_sig::ThresholdPolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdPolicy(tip.policy_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ThresholdError::PolicyNotFound));
+
+        if !threshold_sig::is_signer(&policy.signers, &caller) {
+            panic_with_error!(&env, ThresholdError::NotASigner);
+        }
+
+        // CEI: state before external call
+        tip.status = threshold_sig::ThresholdTipStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ThresholdTip(tip_id), &tip);
+
+        let bal_key = DataKey::CreatorBalance(tip.creator.clone(), tip.token.clone());
+        let bal: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&bal_key, &(bal + tip.amount));
+
+        let tot_key = DataKey::CreatorTotal(tip.creator.clone(), tip.token.clone());
+        let tot: i128 = env.storage().persistent().get(&tot_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&tot_key, &(tot + tip.amount));
+
+        token::Client::new(&env, &tip.token).transfer(
+            &caller,
+            &env.current_contract_address(),
+            &tip.amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("ts_exec"),),
+            (tip_id, tip.creator, tip.amount),
+        );
+    }
+
+    /// Cancels a pending threshold tip. Only the proposer may cancel.
+    ///
+    /// Emits `("ts_cncl",)` with data `tip_id`.
+    pub fn cancel_threshold_tip(env: Env, proposer: Address, tip_id: u64) {
+        Self::require_not_paused(&env);
+        proposer.require_auth();
+
+        let mut tip: threshold_sig::ThresholdTip = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ThresholdTip(tip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ThresholdError::TipNotFound));
+
+        if tip.proposer != proposer {
+            panic_with_error!(&env, ThresholdError::Unauthorized);
+        }
+        if tip.status != threshold_sig::ThresholdTipStatus::Pending {
+            panic_with_error!(&env, ThresholdError::TipNotPending);
+        }
+
+        tip.status = threshold_sig::ThresholdTipStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ThresholdTip(tip_id), &tip);
+
+        env.events().publish((symbol_short!("ts_cncl"),), tip_id);
+    }
+
+    /// Returns a threshold policy by ID.
+    pub fn get_threshold_policy(
+        env: Env,
+        policy_id: u64,
+    ) -> Option<threshold_sig::ThresholdPolicy> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ThresholdPolicy(policy_id))
+    }
+
+    /// Returns a threshold tip by ID.
+    pub fn get_threshold_tip(env: Env, tip_id: u64) -> Option<threshold_sig::ThresholdTip> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ThresholdTip(tip_id))
     }
 }
 
