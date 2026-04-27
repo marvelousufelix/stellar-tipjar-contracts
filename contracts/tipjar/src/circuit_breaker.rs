@@ -3,21 +3,7 @@
 /// This module provides sophisticated automated protection against extreme market volatility,
 /// anomalous trading patterns, and potential attacks within the Stellar tipjar contracts.
 
-use soroban_sdk::{contracttype, contracterror, symbol_short};
-
-/// Storage keys for the enhanced circuit breaker system
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CircuitBreakerKey {
-    /// Enhanced configuration
-    EnhancedConfig,
-    /// Enhanced state
-    EnhancedState,
-    /// Creator-specific overrides
-    CreatorOverrides(soroban_sdk::Address),
-    /// Token-specific limits
-    TokenLimits(soroban_sdk::Address),
-}
+use soroban_sdk::{contracttype, contracterror};
 
 /// Enhanced circuit breaker configuration with comprehensive protection parameters
 #[contracttype]
@@ -580,7 +566,7 @@ pub mod trigger_engine {
     }
 
     /// Calculates cooldown period based on severity and trigger history
-    pub fn calculate_cooldown(
+    fn calculate_cooldown(
         config: &EnhancedCircuitBreakerConfig,
         severity: TriggerSeverity,
         trigger_count: u32,
@@ -615,6 +601,7 @@ pub mod trigger_engine {
 /// Volume tracking and monitoring module
 pub mod volume_tracker {
     use super::*;
+    use soroban_sdk::Address;
 
     /// Updates volume window with new tip data
     pub fn update_volume_window(
@@ -939,11 +926,11 @@ pub mod anomaly_detector {
         // z > 2 (2 std devs) starts to be anomalous
         // z > 3 (3 std devs) is highly anomalous
         if z_score > 300 {
-            10000u32 // Maximum anomaly
+            10000 // Maximum anomaly
         } else if z_score > 200 {
-            (((z_score - 200) * 10000 / 100) as u32).min(10000)
+            ((z_score - 200) * 10000 / 100).min(10000)
         } else {
-            0u32
+            0
         }
     }
 
@@ -1288,6 +1275,7 @@ pub mod pattern_analyzer {
 /// Halt state management module
 pub mod halt_manager {
     use super::*;
+    use soroban_sdk::Env;
 
     /// Activates halt with specified severity and trigger type
     pub fn activate_halt(
@@ -1616,7 +1604,7 @@ pub mod admin {
 
         // Store configuration
         env.storage().instance().set(
-            &CircuitBreakerKey::EnhancedConfig,
+            &super::CircuitBreakerKey::EnhancedConfig,
             config
         );
 
@@ -1631,7 +1619,7 @@ pub mod admin {
 
     /// Gets current enhanced configuration
     pub fn get_enhanced_config(env: &Env) -> Option<EnhancedCircuitBreakerConfig> {
-        env.storage().instance().get(&CircuitBreakerKey::EnhancedConfig)
+        env.storage().instance().get(&super::CircuitBreakerKey::EnhancedConfig)
     }
 
     /// Sets creator-specific limit override
@@ -1648,7 +1636,7 @@ pub mod admin {
         }
 
         env.storage().persistent().set(
-            &CircuitBreakerKey::CreatorOverrides(creator.clone()),
+            &super::CircuitBreakerKey::CreatorOverrides(creator.clone()),
             &limit
         );
 
@@ -1669,7 +1657,7 @@ pub mod admin {
         admin.require_auth();
 
         env.storage().persistent().remove(
-            &CircuitBreakerKey::CreatorOverrides(creator.clone())
+            &super::CircuitBreakerKey::CreatorOverrides(creator.clone())
         );
 
         env.events().publish(
@@ -1681,7 +1669,7 @@ pub mod admin {
     /// Gets creator-specific limit
     pub fn get_creator_limit(env: &Env, creator: &Address) -> Option<i128> {
         env.storage().persistent().get(
-            &CircuitBreakerKey::CreatorOverrides(creator.clone())
+            &super::CircuitBreakerKey::CreatorOverrides(creator.clone())
         )
     }
 
@@ -1699,7 +1687,7 @@ pub mod admin {
         }
 
         env.storage().persistent().set(
-            &CircuitBreakerKey::TokenLimits(token.clone()),
+            &super::CircuitBreakerKey::TokenLimits(token.clone()),
             &limit
         );
 
@@ -1714,7 +1702,7 @@ pub mod admin {
     /// Gets token-specific limit
     pub fn get_token_limit(env: &Env, token: &Address) -> Option<i128> {
         env.storage().persistent().get(
-            &CircuitBreakerKey::TokenLimits(token.clone())
+            &super::CircuitBreakerKey::TokenLimits(token.clone())
         )
     }
 }
@@ -1834,7 +1822,7 @@ pub mod emergency_mode {
         config.emergency_mode = true;
 
         env.storage().instance().set(
-            &CircuitBreakerKey::EnhancedConfig,
+            &super::CircuitBreakerKey::EnhancedConfig,
             config
         );
 
@@ -1855,7 +1843,7 @@ pub mod emergency_mode {
         config.emergency_mode = false;
 
         env.storage().instance().set(
-            &CircuitBreakerKey::EnhancedConfig,
+            &super::CircuitBreakerKey::EnhancedConfig,
             config
         );
 
@@ -1876,7 +1864,7 @@ pub mod emergency_mode {
         config.maintenance_mode = true;
 
         env.storage().instance().set(
-            &CircuitBreakerKey::EnhancedConfig,
+            &super::CircuitBreakerKey::EnhancedConfig,
             config
         );
 
@@ -1897,7 +1885,7 @@ pub mod emergency_mode {
         config.maintenance_mode = false;
 
         env.storage().instance().set(
-            &CircuitBreakerKey::EnhancedConfig,
+            &super::CircuitBreakerKey::EnhancedConfig,
             config
         );
 
@@ -2391,9 +2379,9 @@ pub mod audit {
         let entry = AuditEntry {
             entry_id,
             timestamp,
-            action: action.clone(),
+            action,
             admin: admin.cloned(),
-            details: details.clone(),
+            details,
         };
 
         // Store audit entry (using temporary storage for recent entries)
@@ -2444,7 +2432,7 @@ pub mod audit {
     }
 
     /// Gets current audit ID without incrementing
-    pub fn get_current_audit_id(env: &Env) -> u64 {
+    fn get_current_audit_id(env: &Env) -> u64 {
         env.storage()
             .instance()
             .get(&symbol_short!("aud_ctr"))
