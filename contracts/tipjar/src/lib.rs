@@ -15,6 +15,9 @@ pub mod poly_commit;
 /// Recursive proof composition for efficient verification of tip chains.
 pub mod recursive_proof;
 
+/// Verifiable Random Function for provably fair random selection.
+pub mod vrf;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
     token, Address, BytesN, Env, Map, String, Vec,
