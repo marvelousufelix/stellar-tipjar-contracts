@@ -76,6 +76,9 @@ pub mod quadratic_funding;
 // TWAP oracle
 pub mod twap_oracle;
 
+// Tip payment channels
+pub mod payment_channel;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -838,6 +841,10 @@ pub enum DataKey {
     EncryptedTipCounter,
     /// Nullifier for encrypted tips (prevents double-spend).
     PrivacyNullifier(BytesN<32>),
+    /// Payment channel record keyed by (party_a, party_b, token).
+    PaymentChannel(Address, Address, Address),
+    /// Global counter for payment channel IDs.
+    ChannelCounter,
 }
 
 #[contracterror]
@@ -1099,6 +1106,30 @@ pub enum OtherError {
     ActiveLoanExists = 110,
     InsufficientLendingLiquidity = 111,
     NoActiveCredit = 112,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ChannelError {
+    /// No channel exists for the given parties and token.
+    ChannelNotFound = 200,
+    /// Channel is not in the Open state.
+    ChannelNotOpen = 201,
+    /// Provided nonce is not strictly greater than the current nonce.
+    StaleNonce = 202,
+    /// Caller is not a party to this channel.
+    NotChannelParty = 203,
+    /// Channel is not in the Disputed state.
+    ChannelNotDisputed = 204,
+    /// Dispute window has not yet elapsed.
+    DisputeWindowActive = 205,
+    /// Proposed balance exceeds total channel deposit.
+    InvalidChannelBalance = 206,
+    /// Deposit amount must be greater than zero.
+    InvalidDeposit = 207,
+    /// Dispute window must be greater than zero.
+    InvalidDisputeWindow = 208,
 }
 
 
@@ -8444,6 +8475,273 @@ a
     /// Get proposal threshold adjusted by voter's conviction.
     pub fn get_adjusted_proposal_threshold(env: Env, voter: Address) -> i128 {
         governance::conviction_integration::get_adjusted_proposal_threshold(&env, &voter)
+    }
+
+    // ── payment channels ─────────────────────────────────────────────────────
+
+    /// Opens a bidirectional payment channel between `party_a` and `party_b`.
+    ///
+    /// Both parties' deposits are transferred into contract escrow immediately.
+    /// `dispute_window` is the seconds a counterparty has to submit a newer state
+    /// during a unilateral close.
+    ///
+    /// Emits `("ch_open",)` with data `(party_a, party_b, token, total_deposit)`.
+    pub fn open_channel(
+        env: Env,
+        party_a: Address,
+        party_b: Address,
+        token: Address,
+        deposit_a: i128,
+        deposit_b: i128,
+        dispute_window: u64,
+    ) {
+        Self::require_not_paused(&env);
+        party_a.require_auth();
+        party_b.require_auth();
+
+        if deposit_a <= 0 || deposit_b <= 0 {
+            panic_with_error!(&env, ChannelError::InvalidDeposit);
+        }
+        if dispute_window == 0 {
+            panic_with_error!(&env, ChannelError::InvalidDisputeWindow);
+        }
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        let key = DataKey::PaymentChannel(party_a.clone(), party_b.clone(), token.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ChannelError::ChannelNotOpen);
+        }
+
+        let channel = payment_channel::open(
+            &env, &party_a, &party_b, &token, deposit_a, deposit_b, dispute_window,
+        );
+
+        // CEI: state before external calls
+        env.storage().persistent().set(&key, &channel);
+
+        let tok = token::Client::new(&env, &token);
+        tok.transfer(&party_a, &env.current_contract_address(), &deposit_a);
+        tok.transfer(&party_b, &env.current_contract_address(), &deposit_b);
+
+        env.events().publish(
+            (symbol_short!("ch_open"),),
+            (party_a, party_b, token, deposit_a + deposit_b),
+        );
+    }
+
+    /// Updates the channel's latest agreed balance state.
+    ///
+    /// Both parties must authorise. `new_balance_a` is party_a's new balance;
+    /// `nonce` must be strictly greater than the current nonce.
+    ///
+    /// Emits `("ch_upd",)` with data `(party_a, party_b, token, new_balance_a, nonce)`.
+    pub fn update_channel_state(
+        env: Env,
+        party_a: Address,
+        party_b: Address,
+        token: Address,
+        new_balance_a: i128,
+        nonce: u64,
+    ) {
+        Self::require_not_paused(&env);
+        party_a.require_auth();
+        party_b.require_auth();
+
+        let key = DataKey::PaymentChannel(party_a.clone(), party_b.clone(), token.clone());
+        let mut channel: payment_channel::PaymentChannel = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ChannelError::ChannelNotFound));
+
+        if channel.status != payment_channel::ChannelStatus::Open {
+            panic_with_error!(&env, ChannelError::ChannelNotOpen);
+        }
+        if nonce <= channel.nonce {
+            panic_with_error!(&env, ChannelError::StaleNonce);
+        }
+        if new_balance_a < 0 || new_balance_a > channel.total_deposit {
+            panic_with_error!(&env, ChannelError::InvalidChannelBalance);
+        }
+
+        channel.balance_a = new_balance_a;
+        channel.nonce = nonce;
+        env.storage().persistent().set(&key, &channel);
+
+        env.events().publish(
+            (symbol_short!("ch_upd"),),
+            (party_a, party_b, token, new_balance_a, nonce),
+        );
+    }
+
+    /// Cooperatively closes a channel. Both parties must authorise.
+    ///
+    /// Distributes funds according to the latest agreed state and marks the channel closed.
+    /// Emits `("ch_coop",)` with data `(party_a, party_b, token, balance_a, balance_b)`.
+    pub fn cooperative_close(
+        env: Env,
+        party_a: Address,
+        party_b: Address,
+        token: Address,
+    ) {
+        Self::require_not_paused(&env);
+        party_a.require_auth();
+        party_b.require_auth();
+
+        let key = DataKey::PaymentChannel(party_a.clone(), party_b.clone(), token.clone());
+        let mut channel: payment_channel::PaymentChannel = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ChannelError::ChannelNotFound));
+
+        if channel.status != payment_channel::ChannelStatus::Open {
+            panic_with_error!(&env, ChannelError::ChannelNotOpen);
+        }
+
+        let bal_a = channel.balance_a;
+        let bal_b = payment_channel::balance_b(&channel);
+
+        channel.status = payment_channel::ChannelStatus::Closed;
+        env.storage().persistent().set(&key, &channel);
+
+        let tok = token::Client::new(&env, &token);
+        if bal_a > 0 {
+            tok.transfer(&env.current_contract_address(), &party_a, &bal_a);
+        }
+        if bal_b > 0 {
+            tok.transfer(&env.current_contract_address(), &party_b, &bal_b);
+        }
+
+        env.events().publish(
+            (symbol_short!("ch_coop"),),
+            (party_a, party_b, token, bal_a, bal_b),
+        );
+    }
+
+    /// Initiates or finalises a unilateral (dispute) close.
+    ///
+    /// **First call** (by either party): sets status to `Disputed` and starts the
+    /// dispute window using the caller's proposed `balance_a` / `nonce`.
+    ///
+    /// **Second call** (by the counterparty, within the window): if the submitted
+    /// `nonce` is strictly higher, the newer state is applied before closing.
+    ///
+    /// **After the window**: anyone may call to finalise the close with the last
+    /// submitted state.
+    ///
+    /// Emits `("ch_disp",)` on initiation and `("ch_fin",)` on finalisation.
+    pub fn dispute_close(
+        env: Env,
+        caller: Address,
+        party_a: Address,
+        party_b: Address,
+        token: Address,
+        claimed_balance_a: i128,
+        nonce: u64,
+    ) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let key = DataKey::PaymentChannel(party_a.clone(), party_b.clone(), token.clone());
+        let mut channel: payment_channel::PaymentChannel = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ChannelError::ChannelNotFound));
+
+        if caller != channel.party_a && caller != channel.party_b {
+            panic_with_error!(&env, ChannelError::NotChannelParty);
+        }
+
+        let now = env.ledger().timestamp();
+
+        match channel.status {
+            payment_channel::ChannelStatus::Open => {
+                // Initiate dispute
+                if claimed_balance_a < 0 || claimed_balance_a > channel.total_deposit {
+                    panic_with_error!(&env, ChannelError::InvalidChannelBalance);
+                }
+                if nonce < channel.nonce {
+                    panic_with_error!(&env, ChannelError::StaleNonce);
+                }
+                channel.status = payment_channel::ChannelStatus::Disputed;
+                channel.dispute_started_at = now;
+                channel.disputer = Some(caller.clone());
+                channel.balance_a = claimed_balance_a;
+                channel.nonce = nonce;
+                env.storage().persistent().set(&key, &channel);
+
+                env.events().publish(
+                    (symbol_short!("ch_disp"),),
+                    (caller, party_a, party_b, token, claimed_balance_a, nonce),
+                );
+            }
+            payment_channel::ChannelStatus::Disputed => {
+                let window_end = channel.dispute_started_at + channel.dispute_window;
+
+                if now < window_end {
+                    // Counterparty submitting a newer state
+                    if nonce <= channel.nonce {
+                        panic_with_error!(&env, ChannelError::StaleNonce);
+                    }
+                    if claimed_balance_a < 0 || claimed_balance_a > channel.total_deposit {
+                        panic_with_error!(&env, ChannelError::InvalidChannelBalance);
+                    }
+                    channel.balance_a = claimed_balance_a;
+                    channel.nonce = nonce;
+                    env.storage().persistent().set(&key, &channel);
+
+                    env.events().publish(
+                        (symbol_short!("ch_disp"),),
+                        (caller, party_a, party_b, token, claimed_balance_a, nonce),
+                    );
+                } else {
+                    // Window elapsed — finalise
+                    let bal_a = channel.balance_a;
+                    let bal_b = payment_channel::balance_b(&channel);
+
+                    channel.status = payment_channel::ChannelStatus::Closed;
+                    env.storage().persistent().set(&key, &channel);
+
+                    let tok = token::Client::new(&env, &token);
+                    if bal_a > 0 {
+                        tok.transfer(&env.current_contract_address(), &party_a, &bal_a);
+                    }
+                    if bal_b > 0 {
+                        tok.transfer(&env.current_contract_address(), &party_b, &bal_b);
+                    }
+
+                    env.events().publish(
+                        (symbol_short!("ch_fin"),),
+                        (party_a, party_b, token, bal_a, bal_b),
+                    );
+                }
+            }
+            payment_channel::ChannelStatus::Closed => {
+                panic_with_error!(&env, ChannelError::ChannelNotOpen);
+            }
+        }
+    }
+
+    /// Returns the payment channel between `party_a`, `party_b`, and `token`.
+    pub fn get_channel(
+        env: Env,
+        party_a: Address,
+        party_b: Address,
+        token: Address,
+    ) -> Option<payment_channel::PaymentChannel> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentChannel(party_a, party_b, token))
     }
 }
 
