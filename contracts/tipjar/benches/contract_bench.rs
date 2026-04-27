@@ -57,12 +57,7 @@ fn bench_tip(c: &mut Criterion) {
             let creator = Address::generate(&env);
             token_client.mint(&sender, &1_000);
 
-            client.tip(
-                &sender,
-                &creator,
-                &token_id,
-                black_box(&100i128),
-            );
+            client.tip(&sender, &creator, &token_id, black_box(&100i128));
         });
     });
 }
@@ -84,12 +79,7 @@ fn bench_tip_warm(c: &mut Criterion) {
             client.tip(&sender, &creator, &token_id, &100i128);
 
             // Measured call.
-            client.tip(
-                &sender,
-                &creator,
-                &token_id,
-                black_box(&100i128),
-            );
+            client.tip(&sender, &creator, &token_id, black_box(&100i128));
         });
     });
 }
@@ -107,7 +97,6 @@ fn bench_tip_with_message(c: &mut Criterion) {
             token_client.mint(&sender, &1_000);
 
             let message = String::from_str(&env, "Great content, keep it up!");
-
             client.tip_with_message(
                 &sender,
                 &creator,
@@ -179,10 +168,7 @@ fn bench_get_balance(c: &mut Criterion) {
 
     c.bench_function("get_withdrawable_balance", |b| {
         b.iter(|| {
-            client.get_withdrawable_balance(
-                black_box(&creator),
-                black_box(&token_id),
-            );
+            client.get_withdrawable_balance(black_box(&creator), black_box(&token_id));
         });
     });
 }
@@ -200,10 +186,7 @@ fn bench_get_total_tips(c: &mut Criterion) {
 
     c.bench_function("get_total_tips", |b| {
         b.iter(|| {
-            client.get_total_tips(
-                black_box(&creator),
-                black_box(&token_id),
-            );
+            client.get_total_tips(black_box(&creator), black_box(&token_id));
         });
     });
 }
