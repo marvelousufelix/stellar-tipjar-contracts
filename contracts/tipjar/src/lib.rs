@@ -85,6 +85,18 @@ pub mod twap_oracle;
 // Tip payment channels
 pub mod payment_channel;
 
+// Streaming vesting (#247)
+pub mod streaming_vesting;
+
+// Merkle distributor (#248)
+pub mod merkle_distributor;
+
+// Soulbound tokens (#249)
+pub mod soulbound_token;
+
+// Dynamic NFTs (#250)
+pub mod dynamic_nft;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -851,6 +863,14 @@ pub enum DataKey {
     PaymentChannel(Address, Address, Address),
     /// Global counter for payment channel IDs.
     ChannelCounter,
+    /// Streaming vesting stream keyed by sub-key.
+    VestingStream(streaming_vesting::VestingStreamKey),
+    /// Merkle distributor keyed by sub-key.
+    MerkleDistributor(merkle_distributor::MerkleKey),
+    /// Soulbound token keyed by sub-key.
+    SoulboundToken(soulbound_token::SbtKey),
+    /// Dynamic NFT keyed by sub-key.
+    DynamicNft(dynamic_nft::DynNftKey),
 }
 
 #[contracterror]
@@ -8862,6 +8882,225 @@ a
         let finalized_batches: u64 = env.storage().instance().get(&DataKey::RollupFinalizedCount).unwrap_or(0);
         let challenged_batches: u64 = env.storage().instance().get(&DataKey::RollupChallengedCount).unwrap_or(0);
         rollup::RollupState { enabled, sequencer, challenge_period, pending_batches, finalized_batches, challenged_batches }
+    }
+
+    // ── Streaming Vesting (#247) ──────────────────────────────────────────────
+
+    /// Create a streaming vesting position.
+    ///
+    /// Tokens unlock linearly per second over `duration_seconds`.
+    /// Transfers `total_amount` of `token` from `sender` into escrow.
+    /// Returns the stream ID.
+    pub fn sv_create(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        total_amount: i128,
+        duration_seconds: u64,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        let whitelisted: bool = env.storage().instance()
+            .get(&DataKey::TokenWhitelist(token.clone())).unwrap_or(false);
+        if !whitelisted { panic_with_error!(&env, TipJarError::TokenNotWhitelisted); }
+        streaming_vesting::create(&env, &sender, &recipient, &token, total_amount, duration_seconds)
+    }
+
+    /// Withdraw all currently vested tokens for a streaming vesting stream.
+    ///
+    /// Returns the amount withdrawn.
+    pub fn sv_withdraw(env: Env, recipient: Address, stream_id: u64) -> i128 {
+        Self::require_not_paused(&env);
+        recipient.require_auth();
+        streaming_vesting::withdraw(&env, &recipient, stream_id)
+    }
+
+    /// Cancel a streaming vesting stream. Only the original sender may cancel.
+    ///
+    /// Vested-but-unwithdrawn tokens go to the recipient; unvested tokens are refunded to sender.
+    pub fn sv_cancel(env: Env, sender: Address, stream_id: u64) {
+        Self::require_not_paused(&env);
+        sender.require_auth();
+        streaming_vesting::cancel(&env, &sender, stream_id)
+    }
+
+    /// Returns the amount currently available to withdraw for a stream.
+    pub fn sv_available(env: Env, stream_id: u64) -> i128 {
+        streaming_vesting::available_to_withdraw(&env, stream_id)
+    }
+
+    /// Returns the streaming vesting stream record.
+    pub fn sv_get_stream(env: Env, stream_id: u64) -> streaming_vesting::VestingStream {
+        streaming_vesting::get_stream(&env, stream_id)
+    }
+
+    /// Returns all stream IDs for a recipient.
+    pub fn sv_get_recipient_streams(env: Env, recipient: Address) -> Vec<u64> {
+        streaming_vesting::get_recipient_streams(&env, &recipient)
+    }
+
+    /// Returns all stream IDs for a sender.
+    pub fn sv_get_sender_streams(env: Env, sender: Address) -> Vec<u64> {
+        streaming_vesting::get_sender_streams(&env, &sender)
+    }
+
+    // ── Merkle Distributor (#248) ─────────────────────────────────────────────
+
+    /// Create a Merkle distribution campaign.
+    ///
+    /// Transfers `total_amount` of `token` from `creator` into escrow.
+    /// Returns the distribution ID.
+    pub fn md_create(
+        env: Env,
+        creator: Address,
+        token: Address,
+        root: BytesN<32>,
+        total_amount: i128,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+        let whitelisted: bool = env.storage().instance()
+            .get(&DataKey::TokenWhitelist(token.clone())).unwrap_or(false);
+        if !whitelisted { panic_with_error!(&env, TipJarError::TokenNotWhitelisted); }
+        merkle_distributor::create_distribution(&env, &creator, &token, root, total_amount)
+    }
+
+    /// Claim an allocation from a Merkle distribution.
+    ///
+    /// `proof` is an ordered list of sibling hashes from leaf to root.
+    pub fn md_claim(
+        env: Env,
+        distribution_id: u64,
+        recipient: Address,
+        amount: i128,
+        proof: Vec<BytesN<32>>,
+    ) {
+        Self::require_not_paused(&env);
+        recipient.require_auth();
+        merkle_distributor::claim(&env, distribution_id, &recipient, amount, proof)
+    }
+
+    /// Deactivate a Merkle distribution. Admin only.
+    pub fn md_deactivate(env: Env, admin: Address, distribution_id: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin { panic_with_error!(&env, TipJarError::Unauthorized); }
+        merkle_distributor::deactivate(&env, distribution_id)
+    }
+
+    /// Returns whether `recipient` has already claimed from `distribution_id`.
+    pub fn md_is_claimed(env: Env, distribution_id: u64, recipient: Address) -> bool {
+        merkle_distributor::is_claimed(&env, distribution_id, &recipient)
+    }
+
+    /// Returns the Merkle distribution record.
+    pub fn md_get_distribution(env: Env, distribution_id: u64) -> merkle_distributor::MerkleDistribution {
+        merkle_distributor::get_distribution(&env, distribution_id)
+    }
+
+    // ── Soulbound Tokens (#249) ───────────────────────────────────────────────
+
+    /// Mint a soulbound token to `owner`. Admin only.
+    ///
+    /// Returns the token ID.
+    pub fn sbt_mint(
+        env: Env,
+        admin: Address,
+        owner: Address,
+        achievement: String,
+        metadata: String,
+    ) -> u64 {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin { panic_with_error!(&env, TipJarError::Unauthorized); }
+        soulbound_token::mint(&env, &owner, achievement, metadata)
+    }
+
+    /// Revoke a soulbound token. Admin only.
+    pub fn sbt_revoke(env: Env, admin: Address, token_id: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin { panic_with_error!(&env, TipJarError::Unauthorized); }
+        soulbound_token::revoke(&env, token_id)
+    }
+
+    /// Returns the soulbound token record.
+    pub fn sbt_get(env: Env, token_id: u64) -> soulbound_token::SoulboundToken {
+        soulbound_token::get_token(&env, token_id)
+    }
+
+    /// Returns all SBT IDs owned by `owner`.
+    pub fn sbt_get_owner_tokens(env: Env, owner: Address) -> Vec<u64> {
+        soulbound_token::get_owner_tokens(&env, &owner)
+    }
+
+    /// Returns `true` if `owner` holds a non-revoked SBT for `achievement`.
+    pub fn sbt_has_achievement(env: Env, owner: Address, achievement: String) -> bool {
+        soulbound_token::has_achievement(&env, &owner, &achievement)
+    }
+
+    // ── Dynamic NFTs (#250) ───────────────────────────────────────────────────
+
+    /// Mint a dynamic NFT. Admin only.
+    ///
+    /// Returns the NFT ID.
+    pub fn dnft_mint(
+        env: Env,
+        admin: Address,
+        owner: Address,
+        metadata_uri: String,
+        initial_traits: Map<String, String>,
+    ) -> u64 {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin { panic_with_error!(&env, TipJarError::Unauthorized); }
+        dynamic_nft::mint(&env, &owner, metadata_uri, initial_traits)
+    }
+
+    /// Record a tip contribution to a dynamic NFT, potentially triggering evolution.
+    ///
+    /// Anyone may call this to associate a tip with an NFT.
+    pub fn dnft_record_tip(env: Env, nft_id: u64, tip_amount: i128) {
+        if tip_amount <= 0 { panic_with_error!(&env, TipJarError::InvalidAmount); }
+        dynamic_nft::record_tip(&env, nft_id, tip_amount)
+    }
+
+    /// Update a trait on a dynamic NFT. Only the NFT owner may call.
+    pub fn dnft_update_trait(
+        env: Env,
+        owner: Address,
+        nft_id: u64,
+        key: String,
+        value: String,
+    ) {
+        owner.require_auth();
+        let nft = dynamic_nft::get_nft(&env, nft_id);
+        if nft.owner != owner { panic_with_error!(&env, TipJarError::Unauthorized); }
+        dynamic_nft::update_trait(&env, nft_id, key, value)
+    }
+
+    /// Update the metadata URI of a dynamic NFT. Only the NFT owner may call.
+    pub fn dnft_update_metadata(env: Env, owner: Address, nft_id: u64, metadata_uri: String) {
+        owner.require_auth();
+        let nft = dynamic_nft::get_nft(&env, nft_id);
+        if nft.owner != owner { panic_with_error!(&env, TipJarError::Unauthorized); }
+        dynamic_nft::update_metadata(&env, nft_id, metadata_uri)
+    }
+
+    /// Returns the dynamic NFT record.
+    pub fn dnft_get(env: Env, nft_id: u64) -> dynamic_nft::DynamicNft {
+        dynamic_nft::get_nft(&env, nft_id)
+    }
+
+    /// Returns all NFT IDs owned by `owner`.
+    pub fn dnft_get_owner_nfts(env: Env, owner: Address) -> Vec<u64> {
+        dynamic_nft::get_owner_nfts(&env, &owner)
+    }
+
+    /// Returns the evolution history for a dynamic NFT.
+    pub fn dnft_get_history(env: Env, nft_id: u64) -> Vec<dynamic_nft::EvolutionEvent> {
+        dynamic_nft::get_evolution_history(&env, nft_id)
     }
 }
 
