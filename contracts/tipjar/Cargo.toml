@@ -102,3 +102,8 @@ path = "tests/royalty_split_tests.rs"
 [[test]]
 name = "derivatives_tests"
 path = "tests/derivatives_tests.rs"
+
+[[test]]
+name = "plasma_tests"
+path = "tests/plasma_tests.rs"
+

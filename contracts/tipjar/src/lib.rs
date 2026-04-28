@@ -99,6 +99,9 @@ pub mod royalty;
 // Zero-knowledge proofs for private tip verification
 pub mod zk_proof;
 
+// Plasma chains for high-throughput tip processing
+pub mod plasma;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -917,6 +920,28 @@ pub enum DataKey {
     ZkProofCounter,
     /// Global ZK private tip counter.
     ZkPrivateTipCounter,
+    /// Plasma feature enabled flag.
+    PlasmaEnabled,
+    /// Authorized Plasma operator address.
+    PlasmaOperator,
+    /// Plasma block commitment by block number.
+    PlasmaBlock(u64),
+    /// Latest committed Plasma block number.
+    PlasmaLatestBlock,
+    /// Global Plasma block counter.
+    PlasmaBlockCounter,
+    /// Plasma exit request by exit ID.
+    PlasmaExit(u64),
+    /// Global Plasma exit ID counter.
+    PlasmaExitCounter,
+    /// Total processed exits counter.
+    PlasmaTotalExits,
+    /// Challenge for a Plasma exit by exit ID.
+    PlasmaChallenge(u64),
+    /// Pending exit IDs for a user address.
+    PlasmaUserExits(Address),
+    /// Finalized volume per exitor per token.
+    PlasmaFinalizedVolume(Address, Address),
 }
 
 #[contracterror]
