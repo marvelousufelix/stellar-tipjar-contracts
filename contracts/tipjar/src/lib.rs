@@ -94,6 +94,9 @@ pub mod meta_tx;
 // Royalty splits for collaborative content and team tips
 pub mod royalty;
 
+// Unified derivatives platform: options, futures, swaps
+pub mod derivatives;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -874,6 +877,19 @@ pub enum DataKey {
     MetaTxRecord(u64),
     /// Global meta-transaction record counter.
     MetaTxCounter,
+    // ── Derivatives platform ──────────────────────────────────────────────
+    /// Unified derivative contract record keyed by contract ID.
+    Derivative(u64),
+    /// Global counter for derivative contract IDs.
+    DerivativeCounter,
+    /// Per-account derivative portfolio summary.
+    DerivativePortfolio(Address),
+    /// List of contract IDs an account is party to.
+    DerivativeAccountContracts(Address),
+    /// List of all active derivative contract IDs.
+    DerivativeActiveList,
+    /// Global derivatives module configuration.
+    DerivativesConfig,
 }
 
 #[contracterror]
