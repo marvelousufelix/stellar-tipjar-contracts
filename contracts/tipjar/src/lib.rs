@@ -97,6 +97,9 @@ pub mod royalty;
 // Unified derivatives platform: options, futures, swaps
 pub mod derivatives;
 
+// On-chain reputation system
+pub mod reputation;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -890,6 +893,11 @@ pub enum DataKey {
     DerivativeActiveList,
     /// Global derivatives module configuration.
     DerivativesConfig,
+    // ── Reputation system ─────────────────────────────────────────────────
+    /// Reputation score for an account.
+    ReputationScore(Address),
+    /// Reputation history ring-buffer for an account.
+    ReputationHistory(Address),
 }
 
 #[contracterror]

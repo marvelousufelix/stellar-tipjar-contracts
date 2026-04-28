@@ -102,3 +102,7 @@ path = "tests/royalty_split_tests.rs"
 [[test]]
 name = "derivatives_tests"
 path = "tests/derivatives_tests.rs"
+
+[[test]]
+name = "reputation_tests"
+path = "tests/reputation_tests.rs"
