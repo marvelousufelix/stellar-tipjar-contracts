@@ -2133,6 +2133,10 @@ impl TipJarContract {
 
         Self::update_leaderboard_stats(&env, &sender, &creator, creator_amount);
 
+        // Record reputation for tipper and creator
+        reputation::record_tip_sent(&env, &sender, amount);
+        reputation::record_tip_received(&env, &creator, creator_amount);
+
         // Track which tokens this creator has received
         Self::track_creator_token(&env, &creator, &token);
 
@@ -9394,6 +9398,23 @@ a
     /// Returns the accumulated split balance for `recipient`.
     pub fn get_split_balance(env: Env, recipient: Address) -> i128 {
         royalty::get_balance(&env, &recipient)
+    }
+
+    // ── reputation system ────────────────────────────────────────────────────
+
+    /// Returns the reputation score for an account.
+    pub fn get_reputation(env: Env, account: Address) -> reputation::ReputationScore {
+        reputation::get_score(&env, &account)
+    }
+
+    /// Returns the reputation history for an account.
+    pub fn get_reputation_history(env: Env, account: Address) -> Vec<reputation::RepHistoryEntry> {
+        reputation::get_reputation_history(&env, &account)
+    }
+
+    /// Manually trigger reputation decay for an account.
+    pub fn trigger_reputation_decay(env: Env, account: Address) {
+        reputation::trigger_decay(&env, &account);
     }
 }
 
