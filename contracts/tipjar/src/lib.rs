@@ -85,8 +85,8 @@ pub mod twap_oracle;
 // Tip payment channels
 pub mod payment_channel;
 
-// Fractional ownership of tip revenue streams
-pub mod fractional_ownership;
+// Tip state channels (off-chain tips with on-chain settlement)
+pub mod state_channel;
 
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
@@ -854,12 +854,10 @@ pub enum DataKey {
     PaymentChannel(Address, Address, Address),
     /// Global counter for payment channel IDs.
     ChannelCounter,
-    /// Fractional ownership pool for a creator.
-    FractionPool(Address),
-    /// Fraction position keyed by (creator, holder).
-    FractionPosition(Address, Address),
-    /// List of fraction holders for a creator.
-    FractionHolders(Address),
+    /// Tip state channel record keyed by (tipper, creator, token).
+    TipChannel(Address, Address, Address),
+    /// Individual tip entry within a state channel keyed by (tipper, creator, token, index).
+    TipChannelEntry(Address, Address, Address, u64),
 }
 
 #[contracterror]
@@ -1177,7 +1175,30 @@ pub enum ChannelError {
     InvalidDisputeWindow = 208,
 }
 
-
+/// Errors specific to tip state channels.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum TipChannelError {
+    /// No tip channel exists for the given parties and token.
+    ChannelNotFound = 300,
+    /// Channel is not in the Open state.
+    ChannelNotOpen = 301,
+    /// Provided nonce is not strictly greater than the current nonce.
+    StaleNonce = 302,
+    /// Caller is not a party to this channel.
+    NotChannelParty = 303,
+    /// Deposit amount must be greater than zero.
+    InvalidDeposit = 304,
+    /// Dispute window must be greater than zero.
+    InvalidDisputeWindow = 305,
+    /// Tipped amount exceeds the channel deposit.
+    ExceedsDeposit = 306,
+    /// Tipped amount cannot decrease.
+    TippedAmountDecreased = 307,
+    /// Channel is already settled.
+    AlreadySettled = 308,
+}
 
 #[contract]
 pub struct TipJarContract;
@@ -8787,6 +8808,179 @@ a
         env.storage()
             .persistent()
             .get(&DataKey::PaymentChannel(party_a, party_b, token))
+    }
+
+    // ── tip state channels ───────────────────────────────────────────────────
+
+    /// Opens a tip state channel between `tipper` and `creator`.
+    ///
+    /// Transfers `deposit` from `tipper` into contract escrow.
+    /// Emits `("tch_open",)` with `(tipper, creator, token, deposit)`.
+    pub fn open_tip_channel(
+        env: Env,
+        tipper: Address,
+        creator: Address,
+        token: Address,
+        deposit: i128,
+        dispute_window: u64,
+    ) {
+        Self::require_not_paused(&env);
+        tipper.require_auth();
+
+        if deposit <= 0 {
+            panic_with_error!(&env, TipChannelError::InvalidDeposit);
+        }
+        if dispute_window == 0 {
+            panic_with_error!(&env, TipChannelError::InvalidDisputeWindow);
+        }
+
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        let key = DataKey::TipChannel(tipper.clone(), creator.clone(), token.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, TipChannelError::ChannelNotOpen);
+        }
+
+        state_channel::open(&env, &tipper, &creator, &token, deposit, dispute_window);
+    }
+
+    /// Records an off-chain tip state update. Both parties must authorise.
+    ///
+    /// `new_tipped_amount` is the new cumulative total; `nonce` must be strictly greater.
+    /// Emits `("tch_tip",)` with `(tipper, creator, token, tip_amount, nonce)`.
+    pub fn record_channel_tip(
+        env: Env,
+        tipper: Address,
+        creator: Address,
+        token: Address,
+        new_tipped_amount: i128,
+        nonce: u64,
+    ) {
+        Self::require_not_paused(&env);
+        tipper.require_auth();
+        creator.require_auth();
+
+        let key = DataKey::TipChannel(tipper.clone(), creator.clone(), token.clone());
+        if !env.storage().persistent().has(&key) {
+            panic_with_error!(&env, TipChannelError::ChannelNotFound);
+        }
+
+        let channel = state_channel::load(&env, &tipper, &creator, &token);
+        if channel.status != state_channel::TipChannelStatus::Open {
+            panic_with_error!(&env, TipChannelError::ChannelNotOpen);
+        }
+        if nonce <= channel.nonce {
+            panic_with_error!(&env, TipChannelError::StaleNonce);
+        }
+        if new_tipped_amount < channel.tipped_amount {
+            panic_with_error!(&env, TipChannelError::TippedAmountDecreased);
+        }
+        if new_tipped_amount > channel.deposit {
+            panic_with_error!(&env, TipChannelError::ExceedsDeposit);
+        }
+
+        state_channel::record_tip(&env, &tipper, &creator, &token, new_tipped_amount, nonce);
+    }
+
+    /// Cooperatively settles a tip channel. Both parties must authorise.
+    ///
+    /// Distributes `tipped_amount` to creator and remainder to tipper.
+    /// Emits `("tch_setl",)` with `(tipper, creator, token, to_creator, to_tipper)`.
+    pub fn settle_tip_channel(
+        env: Env,
+        tipper: Address,
+        creator: Address,
+        token: Address,
+    ) {
+        Self::require_not_paused(&env);
+        tipper.require_auth();
+        creator.require_auth();
+
+        let key = DataKey::TipChannel(tipper.clone(), creator.clone(), token.clone());
+        if !env.storage().persistent().has(&key) {
+            panic_with_error!(&env, TipChannelError::ChannelNotFound);
+        }
+
+        let channel = state_channel::load(&env, &tipper, &creator, &token);
+        if channel.status != state_channel::TipChannelStatus::Open {
+            panic_with_error!(&env, TipChannelError::ChannelNotOpen);
+        }
+
+        state_channel::settle(&env, &tipper, &creator, &token);
+    }
+
+    /// Initiates or finalises a unilateral dispute close on a tip channel.
+    ///
+    /// First call: sets status to `Disputed`, records claimed state.
+    /// Second call (counterparty, within window): may submit a newer state.
+    /// After window: anyone may finalise.
+    /// Emits `("tch_disp",)` on initiation/update and `("tch_fin",)` on finalisation.
+    pub fn dispute_tip_channel(
+        env: Env,
+        caller: Address,
+        tipper: Address,
+        creator: Address,
+        token: Address,
+        claimed_tipped_amount: i128,
+        nonce: u64,
+    ) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let key = DataKey::TipChannel(tipper.clone(), creator.clone(), token.clone());
+        if !env.storage().persistent().has(&key) {
+            panic_with_error!(&env, TipChannelError::ChannelNotFound);
+        }
+
+        let channel = state_channel::load(&env, &tipper, &creator, &token);
+        if caller != channel.tipper && caller != channel.creator {
+            panic_with_error!(&env, TipChannelError::NotChannelParty);
+        }
+        if channel.status == state_channel::TipChannelStatus::Settled {
+            panic_with_error!(&env, TipChannelError::AlreadySettled);
+        }
+        if claimed_tipped_amount < 0 || claimed_tipped_amount > channel.deposit {
+            panic_with_error!(&env, TipChannelError::ExceedsDeposit);
+        }
+
+        state_channel::dispute(
+            &env,
+            &caller,
+            &tipper,
+            &creator,
+            &token,
+            claimed_tipped_amount,
+            nonce,
+        );
+    }
+
+    /// Returns the tip state channel for `(tipper, creator, token)`.
+    pub fn get_tip_channel(
+        env: Env,
+        tipper: Address,
+        creator: Address,
+        token: Address,
+    ) -> Option<state_channel::TipStateChannel> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TipChannel(tipper, creator, token))
+    }
+
+    /// Returns all recorded tip entries for a tip state channel.
+    pub fn get_tip_channel_tips(
+        env: Env,
+        tipper: Address,
+        creator: Address,
+        token: Address,
+    ) -> Vec<state_channel::ChannelTip> {
+        state_channel::get_channel_tips(&env, &tipper, &creator, &token)
     }
 
     // ── optimistic rollup ────────────────────────────────────────────────────
