@@ -108,9 +108,7 @@ pub fn next_puzzle_id(env: &Env) -> u64 {
         .get(&DataKey::PuzzleCounter)
         .unwrap_or(0)
         + 1;
-    env.storage()
-        .persistent()
-        .set(&DataKey::PuzzleCounter, &id);
+    env.storage().persistent().set(&DataKey::PuzzleCounter, &id);
     id
 }
 

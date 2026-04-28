@@ -3,7 +3,9 @@
 use soroban_sdk::{BytesN, Env};
 
 use super::{
-    get_puzzle, puzzle::{is_time_reached, verify_solution}, save_puzzle, PuzzleStatus, TimeLockPuzzle,
+    get_puzzle,
+    puzzle::{is_time_reached, verify_solution},
+    save_puzzle, PuzzleStatus, TimeLockPuzzle,
 };
 
 /// Result of a solve attempt.
