@@ -94,8 +94,20 @@ pub mod meta_tx;
 // Royalty splits for collaborative content and team tips
 pub mod royalty;
 
-// Unified derivatives platform: options, futures, swaps
-pub mod derivatives;
+// Zero-knowledge proofs for private tip verification
+pub mod zk_proof;
+
+// Cross-contract call routing and batch execution
+pub mod cross_contract;
+
+// Tip sharding for parallel processing
+pub mod sharding;
+
+// Tip validity proofs for lightweight verification
+pub mod validity_proof;
+
+// Verkle tree for efficient tip state proofs
+pub mod verkle_tree;
 
 // On-chain reputation system
 pub mod reputation;
@@ -880,24 +892,44 @@ pub enum DataKey {
     MetaTxRecord(u64),
     /// Global meta-transaction record counter.
     MetaTxCounter,
-    // ── Derivatives platform ──────────────────────────────────────────────
-    /// Unified derivative contract record keyed by contract ID.
-    Derivative(u64),
-    /// Global counter for derivative contract IDs.
-    DerivativeCounter,
-    /// Per-account derivative portfolio summary.
-    DerivativePortfolio(Address),
-    /// List of contract IDs an account is party to.
-    DerivativeAccountContracts(Address),
-    /// List of all active derivative contract IDs.
-    DerivativeActiveList,
-    /// Global derivatives module configuration.
-    DerivativesConfig,
-    // ── Reputation system ─────────────────────────────────────────────────
-    /// Reputation score for an account.
-    ReputationScore(Address),
-    /// Reputation history ring-buffer for an account.
-    ReputationHistory(Address),
+    /// Commit-reveal round keyed by round ID.
+    CommitRevealRound(u64),
+    /// Commitment keyed by (round_id, participant).
+    CommitRevealCommitment(u64, Address),
+    /// Reveal keyed by (round_id, participant).
+    CommitRevealReveal(u64, Address),
+    /// List of round IDs created by a creator.
+    CommitRevealCreatorRounds(Address),
+    /// Global commit-reveal round counter.
+    CommitRevealCounter,
+    /// ZK circuit verification key keyed by circuit ID.
+    ZkCircuit(u64),
+    /// ZK proof keyed by proof ID.
+    ZkProof(u64),
+    /// Private tip with ZK proof keyed by tip ID.
+    ZkPrivateTip(u64),
+    /// Nullifier used flag keyed by nullifier hash.
+    ZkNullifier(BytesN<32>),
+    /// List of circuit IDs owned by an address.
+    ZkOwnerCircuits(Address),
+    /// List of proof IDs submitted by a prover.
+    ZkProverProofs(Address),
+    /// List of private tip IDs for a creator.
+    ZkCreatorPrivateTips(Address),
+    /// Global ZK circuit counter.
+    ZkCircuitCounter,
+    /// Global ZK proof counter.
+    ZkProofCounter,
+    /// Global ZK private tip counter.
+    ZkPrivateTipCounter,
+    /// Cross-contract call sub-keys.
+    CrossCall(cross_contract::CrossCallKey),
+    /// Sharding sub-keys.
+    Shard(sharding::ShardKey),
+    /// Validity proof sub-keys.
+    ValidityProof(validity_proof::ValidityProofKey),
+    /// Verkle tree sub-keys.
+    Verkle(verkle_tree::VerkleKey),
 }
 
 #[contracterror]
@@ -1263,6 +1295,76 @@ pub enum MetaTxError {
     RelayerAlreadyRegistered = 407,
     /// Relayer is not registered (cannot remove).
     RelayerNotFound = 408,
+}
+
+/// Errors for commit-reveal operations.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CommitRevealError {
+    /// Round not found.
+    RoundNotFound = 500,
+    /// Round is not in the commit phase.
+    NotInCommitPhase = 501,
+    /// Round is not in the reveal phase.
+    NotInRevealPhase = 502,
+    /// Commit phase has not started yet.
+    CommitPhaseNotStarted = 503,
+    /// Commit phase has ended.
+    CommitPhaseEnded = 504,
+    /// Reveal phase has ended.
+    RevealPhaseEnded = 505,
+    /// Participant has already committed.
+    AlreadyCommitted = 506,
+    /// Participant has already revealed.
+    AlreadyRevealed = 507,
+    /// No commitment found for this participant.
+    NoCommitment = 508,
+    /// Revealed value does not match commitment hash.
+    InvalidReveal = 509,
+    /// Round is already finalized or cancelled.
+    RoundNotActive = 510,
+    /// Commit duration is invalid (too short or too long).
+    InvalidCommitDuration = 511,
+    /// Reveal duration is invalid (too short or too long).
+    InvalidRevealDuration = 512,
+    /// Reveal phase has not ended yet.
+    RevealPhaseNotEnded = 513,
+    /// Commit phase has not ended yet.
+    CommitPhaseNotEnded = 514,
+}
+
+/// Errors for zero-knowledge proof operations.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ZkProofError {
+    /// Circuit not found.
+    CircuitNotFound = 600,
+    /// Circuit is not active.
+    CircuitNotActive = 601,
+    /// Proof not found.
+    ProofNotFound = 602,
+    /// Proof data exceeds maximum size.
+    ProofTooLarge = 603,
+    /// Too many public inputs.
+    TooManyPublicInputs = 604,
+    /// Nullifier has already been used.
+    NullifierUsed = 605,
+    /// Proof is not in pending status.
+    ProofNotPending = 606,
+    /// Proof has not been verified.
+    ProofNotVerified = 607,
+    /// Nullifier mismatch.
+    NullifierMismatch = 608,
+    /// Private tip not found.
+    PrivateTipNotFound = 609,
+    /// Private tip already claimed.
+    AlreadyClaimed = 610,
+    /// Caller is not the circuit owner.
+    NotCircuitOwner = 611,
+    /// Caller is not the tip creator.
+    NotTipCreator = 612,
 }
 
 #[contract]
@@ -9210,6 +9312,468 @@ a
         meta_tx::get_record(&env, record_id)
     }
 
+    // ── commit-reveal (fair auctions & voting) ───────────────────────────────
+
+    /// Creates a new commit-reveal round.
+    ///
+    /// Returns the round ID.
+    /// Emits `("cr_new",)` with `(round_id, creator, timestamp)`.
+    pub fn create_commit_reveal_round(
+        env: Env,
+        creator: Address,
+        round_type: commit_reveal::RoundType,
+        commit_duration: u64,
+        reveal_duration: u64,
+        description: String,
+        token: Option<Address>,
+        min_bid: i128,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        if commit_duration < commit_reveal::MIN_COMMIT_DURATION
+            || commit_duration > commit_reveal::MAX_COMMIT_DURATION
+        {
+            panic_with_error!(&env, CommitRevealError::InvalidCommitDuration);
+        }
+        if reveal_duration < commit_reveal::MIN_REVEAL_DURATION
+            || reveal_duration > commit_reveal::MAX_REVEAL_DURATION
+        {
+            panic_with_error!(&env, CommitRevealError::InvalidRevealDuration);
+        }
+
+        commit_reveal::create_round(
+            &env,
+            &creator,
+            round_type,
+            commit_duration,
+            reveal_duration,
+            description,
+            token,
+            min_bid,
+        )
+    }
+
+    /// Submits a commitment during the commit phase.
+    ///
+    /// `commitment_hash` should be SHA256(value || salt).
+    /// Emits `("cr_cmt",)` with `(round_id, participant, commitment_hash)`.
+    pub fn commit_to_round(
+        env: Env,
+        round_id: u64,
+        participant: Address,
+        commitment_hash: BytesN<32>,
+    ) {
+        Self::require_not_paused(&env);
+        participant.require_auth();
+
+        let round = commit_reveal::get_round(&env, round_id);
+        if round.is_none() {
+            panic_with_error!(&env, CommitRevealError::RoundNotFound);
+        }
+        let round = round.unwrap();
+
+        if round.status != commit_reveal::RoundStatus::Committing {
+            panic_with_error!(&env, CommitRevealError::NotInCommitPhase);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < round.commit_start {
+            panic_with_error!(&env, CommitRevealError::CommitPhaseNotStarted);
+        }
+        if now >= round.commit_end {
+            panic_with_error!(&env, CommitRevealError::CommitPhaseEnded);
+        }
+
+        let key = DataKey::CommitRevealCommitment(round_id, participant.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, CommitRevealError::AlreadyCommitted);
+        }
+
+        commit_reveal::commit(&env, round_id, &participant, commitment_hash);
+    }
+
+    /// Advances a round from Committing to Revealing status.
+    ///
+    /// Can be called by anyone once the commit phase has ended.
+    /// Emits `("cr_rvl",)` with `(round_id)`.
+    pub fn start_reveal_phase(env: Env, round_id: u64) {
+        Self::require_not_paused(&env);
+
+        let round = commit_reveal::get_round(&env, round_id);
+        if round.is_none() {
+            panic_with_error!(&env, CommitRevealError::RoundNotFound);
+        }
+        let round = round.unwrap();
+
+        if round.status != commit_reveal::RoundStatus::Committing {
+            panic_with_error!(&env, CommitRevealError::NotInCommitPhase);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < round.commit_end {
+            panic_with_error!(&env, CommitRevealError::CommitPhaseNotEnded);
+        }
+
+        commit_reveal::start_reveal_phase(&env, round_id);
+    }
+
+    /// Reveals a commitment during the reveal phase.
+    ///
+    /// Verifies that `SHA256(value || salt) == commitment_hash`.
+    /// Emits `("cr_rvld",)` with `(round_id, participant, value)`.
+    pub fn reveal_commitment(
+        env: Env,
+        round_id: u64,
+        participant: Address,
+        value: i128,
+        salt: BytesN<32>,
+    ) {
+        Self::require_not_paused(&env);
+        participant.require_auth();
+
+        let round = commit_reveal::get_round(&env, round_id);
+        if round.is_none() {
+            panic_with_error!(&env, CommitRevealError::RoundNotFound);
+        }
+        let round = round.unwrap();
+
+        if round.status != commit_reveal::RoundStatus::Revealing {
+            panic_with_error!(&env, CommitRevealError::NotInRevealPhase);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= round.reveal_end {
+            panic_with_error!(&env, CommitRevealError::RevealPhaseEnded);
+        }
+
+        let commit_key = DataKey::CommitRevealCommitment(round_id, participant.clone());
+        let commitment: Option<commit_reveal::Commitment> =
+            env.storage().persistent().get(&commit_key);
+        if commitment.is_none() {
+            panic_with_error!(&env, CommitRevealError::NoCommitment);
+        }
+        let commitment = commitment.unwrap();
+
+        if commitment.revealed {
+            panic_with_error!(&env, CommitRevealError::AlreadyRevealed);
+        }
+
+        let computed = commit_reveal::compute_commitment(&env, value, &salt);
+        if computed != commitment.commitment_hash {
+            panic_with_error!(&env, CommitRevealError::InvalidReveal);
+        }
+
+        commit_reveal::reveal(&env, round_id, &participant, value, salt);
+    }
+
+    /// Finalizes a round after the reveal phase ends.
+    ///
+    /// For auctions: determines the winner (highest bid).
+    /// Can be called by anyone once the reveal phase has ended.
+    /// Emits `("cr_fin",)` with `(round_id, winner, winning_bid)`.
+    pub fn finalize_commit_reveal_round(env: Env, round_id: u64) {
+        Self::require_not_paused(&env);
+
+        let round = commit_reveal::get_round(&env, round_id);
+        if round.is_none() {
+            panic_with_error!(&env, CommitRevealError::RoundNotFound);
+        }
+        let round = round.unwrap();
+
+        if round.status != commit_reveal::RoundStatus::Revealing {
+            panic_with_error!(&env, CommitRevealError::NotInRevealPhase);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < round.reveal_end {
+            panic_with_error!(&env, CommitRevealError::RevealPhaseNotEnded);
+        }
+
+        commit_reveal::finalize_round(&env, round_id);
+    }
+
+    /// Cancels a round. Creator or admin only.
+    ///
+    /// Emits `("cr_cncl",)` with `(round_id)`.
+    pub fn cancel_commit_reveal_round(env: Env, caller: Address, round_id: u64) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let round = commit_reveal::get_round(&env, round_id);
+        if round.is_none() {
+            panic_with_error!(&env, CommitRevealError::RoundNotFound);
+        }
+        let round = round.unwrap();
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != round.creator && caller != admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        if round.status == commit_reveal::RoundStatus::Finalized
+            || round.status == commit_reveal::RoundStatus::Cancelled
+        {
+            panic_with_error!(&env, CommitRevealError::RoundNotActive);
+        }
+
+        commit_reveal::cancel_round(&env, round_id);
+    }
+
+    /// Returns a commit-reveal round by ID.
+    pub fn get_commit_reveal_round(
+        env: Env,
+        round_id: u64,
+    ) -> Option<commit_reveal::CommitRevealRound> {
+        commit_reveal::get_round(&env, round_id)
+    }
+
+    /// Returns a commitment for a participant in a round.
+    pub fn get_commitment(
+        env: Env,
+        round_id: u64,
+        participant: Address,
+    ) -> Option<commit_reveal::Commitment> {
+        commit_reveal::get_commitment(&env, round_id, &participant)
+    }
+
+    /// Returns a reveal for a participant in a round.
+    pub fn get_reveal(
+        env: Env,
+        round_id: u64,
+        participant: Address,
+    ) -> Option<commit_reveal::Reveal> {
+        commit_reveal::get_reveal(&env, round_id, &participant)
+    }
+
+    /// Returns all round IDs created by a creator.
+    pub fn get_creator_commit_reveal_rounds(env: Env, creator: Address) -> Vec<u64> {
+        commit_reveal::get_creator_rounds(&env, &creator)
+    }
+
+    // ── zero-knowledge proofs (private tip verification) ─────────────────────
+
+    /// Registers a new ZK circuit verification key.
+    ///
+    /// Returns the circuit ID.
+    /// Emits `("zk_reg",)` with `(circuit_id, owner, vk_hash)`.
+    pub fn register_zk_circuit(
+        env: Env,
+        owner: Address,
+        circuit_type: zk_proof::CircuitType,
+        vk_hash: BytesN<32>,
+        description: String,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        owner.require_auth();
+
+        zk_proof::register_circuit(&env, &owner, circuit_type, vk_hash, description)
+    }
+
+    /// Deactivates a ZK circuit. Owner only.
+    ///
+    /// Emits `("zk_deact",)` with `(circuit_id)`.
+    pub fn deactivate_zk_circuit(env: Env, owner: Address, circuit_id: u64) {
+        Self::require_not_paused(&env);
+        owner.require_auth();
+
+        let circuit = zk_proof::get_circuit(&env, circuit_id);
+        if circuit.is_none() {
+            panic_with_error!(&env, ZkProofError::CircuitNotFound);
+        }
+        let circuit = circuit.unwrap();
+
+        if circuit.owner != owner {
+            panic_with_error!(&env, ZkProofError::NotCircuitOwner);
+        }
+
+        zk_proof::deactivate_circuit(&env, circuit_id);
+    }
+
+    /// Submits a zero-knowledge proof for verification.
+    ///
+    /// Returns the proof ID.
+    /// Emits `("zk_sub",)` with `(proof_id, prover, circuit_id, nullifier)`.
+    pub fn submit_zk_proof(
+        env: Env,
+        prover: Address,
+        circuit_id: u64,
+        proof_data: Bytes,
+        public_inputs: Vec<BytesN<32>>,
+        private_commitment: BytesN<32>,
+        nullifier: BytesN<32>,
+        metadata: String,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        prover.require_auth();
+
+        let circuit = zk_proof::get_circuit(&env, circuit_id);
+        if circuit.is_none() {
+            panic_with_error!(&env, ZkProofError::CircuitNotFound);
+        }
+        let circuit = circuit.unwrap();
+
+        if !circuit.active {
+            panic_with_error!(&env, ZkProofError::CircuitNotActive);
+        }
+
+        if proof_data.len() > zk_proof::MAX_PROOF_SIZE {
+            panic_with_error!(&env, ZkProofError::ProofTooLarge);
+        }
+
+        if public_inputs.len() > zk_proof::MAX_PUBLIC_INPUTS {
+            panic_with_error!(&env, ZkProofError::TooManyPublicInputs);
+        }
+
+        let nullifier_key = DataKey::ZkNullifier(nullifier.clone());
+        if env.storage().persistent().get(&nullifier_key).unwrap_or(false) {
+            panic_with_error!(&env, ZkProofError::NullifierUsed);
+        }
+
+        zk_proof::submit_proof(
+            &env,
+            &prover,
+            circuit_id,
+            proof_data,
+            public_inputs,
+            private_commitment,
+            nullifier,
+            metadata,
+        )
+    }
+
+    /// Verifies a submitted ZK proof. Admin only.
+    ///
+    /// In production, this would call a ZK verifier. For this implementation,
+    /// the admin manually marks proofs as valid/invalid.
+    /// Emits `("zk_ver",)` with `(proof_id, is_valid)`.
+    pub fn verify_zk_proof(env: Env, admin: Address, proof_id: u64, is_valid: bool) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let proof = zk_proof::get_proof(&env, proof_id);
+        if proof.is_none() {
+            panic_with_error!(&env, ZkProofError::ProofNotFound);
+        }
+        let proof = proof.unwrap();
+
+        if proof.status != zk_proof::ProofStatus::Pending {
+            panic_with_error!(&env, ZkProofError::ProofNotPending);
+        }
+
+        zk_proof::verify_proof(&env, proof_id, is_valid);
+    }
+
+    /// Revokes a ZK proof. Admin only.
+    ///
+    /// Emits `("zk_rvk",)` with `(proof_id)`.
+    pub fn revoke_zk_proof(env: Env, admin: Address, proof_id: u64) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+
+        let proof = zk_proof::get_proof(&env, proof_id);
+        if proof.is_none() {
+            panic_with_error!(&env, ZkProofError::ProofNotFound);
+        }
+
+        zk_proof::revoke_proof(&env, proof_id);
+    }
+
+    /// Creates a private tip using a ZK proof.
+    ///
+    /// Returns the private tip ID.
+    /// Emits `("zk_ptip",)` with `(tip_id, creator, proof_id)`.
+    pub fn create_zk_private_tip(
+        env: Env,
+        creator: Address,
+        proof_id: u64,
+        amount_commitment: BytesN<32>,
+        nullifier: BytesN<32>,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let proof = zk_proof::get_proof(&env, proof_id);
+        if proof.is_none() {
+            panic_with_error!(&env, ZkProofError::ProofNotFound);
+        }
+        let proof = proof.unwrap();
+
+        if proof.status != zk_proof::ProofStatus::Verified {
+            panic_with_error!(&env, ZkProofError::ProofNotVerified);
+        }
+
+        if proof.nullifier != nullifier {
+            panic_with_error!(&env, ZkProofError::NullifierMismatch);
+        }
+
+        zk_proof::create_private_tip(&env, &creator, proof_id, amount_commitment, nullifier)
+    }
+
+    /// Claims/reveals a private tip. Creator only.
+    ///
+    /// Emits `("zk_clm",)` with `(tip_id, creator)`.
+    pub fn claim_zk_private_tip(env: Env, creator: Address, tip_id: u64) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let tip = zk_proof::get_private_tip(&env, tip_id);
+        if tip.is_none() {
+            panic_with_error!(&env, ZkProofError::PrivateTipNotFound);
+        }
+        let tip = tip.unwrap();
+
+        if tip.creator != creator {
+            panic_with_error!(&env, ZkProofError::NotTipCreator);
+        }
+
+        if tip.claimed {
+            panic_with_error!(&env, ZkProofError::AlreadyClaimed);
+        }
+
+        zk_proof::claim_private_tip(&env, tip_id);
+    }
+
+    /// Returns a ZK circuit by ID.
+    pub fn get_zk_circuit(env: Env, circuit_id: u64) -> Option<zk_proof::VerificationKey> {
+        zk_proof::get_circuit(&env, circuit_id)
+    }
+
+    /// Returns a ZK proof by ID.
+    pub fn get_zk_proof(env: Env, proof_id: u64) -> Option<zk_proof::ZkProof> {
+        zk_proof::get_proof(&env, proof_id)
+    }
+
+    /// Returns a private tip by ID.
+    pub fn get_zk_private_tip(env: Env, tip_id: u64) -> Option<zk_proof::PrivateTipProof> {
+        zk_proof::get_private_tip(&env, tip_id)
+    }
+
+    /// Returns all circuit IDs owned by an address.
+    pub fn get_owner_zk_circuits(env: Env, owner: Address) -> Vec<u64> {
+        zk_proof::get_owner_circuits(&env, &owner)
+    }
+
+    /// Returns all proof IDs submitted by a prover.
+    pub fn get_prover_zk_proofs(env: Env, prover: Address) -> Vec<u64> {
+        zk_proof::get_prover_proofs(&env, &prover)
+    }
+
+    /// Returns all private tip IDs for a creator.
+    pub fn get_creator_zk_private_tips(env: Env, creator: Address) -> Vec<u64> {
+        zk_proof::get_creator_private_tips(&env, &creator)
+    }
+
     // ── optimistic rollup ────────────────────────────────────────────────────
 
     /// Initialize the rollup with a designated sequencer.
@@ -9400,21 +9964,224 @@ a
         royalty::get_balance(&env, &recipient)
     }
 
-    // ── reputation system ────────────────────────────────────────────────────
+    // ── Cross-Contract Calls (#215) ──────────────────────────────────────────
 
-    /// Returns the reputation score for an account.
-    pub fn get_reputation(env: Env, account: Address) -> reputation::ReputationScore {
-        reputation::get_score(&env, &account)
+    /// Route a single cross-contract call.
+    ///
+    /// Returns the call ID.
+    pub fn cc_route_call(
+        env: Env,
+        caller: Address,
+        target: Address,
+        call_type: cross_contract::CallType,
+        args: soroban_sdk::Bytes,
+    ) -> u64 {
+        cross_contract::route_call(&env, &caller, &target, call_type, args)
     }
 
-    /// Returns the reputation history for an account.
-    pub fn get_reputation_history(env: Env, account: Address) -> Vec<reputation::RepHistoryEntry> {
-        reputation::get_reputation_history(&env, &account)
+    /// Execute a batch of cross-contract calls.
+    ///
+    /// Returns the batch ID.
+    pub fn cc_route_batch(
+        env: Env,
+        caller: Address,
+        targets: Vec<Address>,
+        call_types: Vec<cross_contract::CallType>,
+        args_list: Vec<soroban_sdk::Bytes>,
+    ) -> u64 {
+        cross_contract::route_batch(&env, &caller, targets, call_types, args_list)
     }
 
-    /// Manually trigger reputation decay for an account.
-    pub fn trigger_reputation_decay(env: Env, account: Address) {
-        reputation::trigger_decay(&env, &account);
+    /// Get a cross-contract call record by ID.
+    pub fn cc_get_call(env: Env, call_id: u64) -> Option<cross_contract::CrossCall> {
+        cross_contract::get_call(&env, call_id)
+    }
+
+    /// Get a batch record by ID.
+    pub fn cc_get_batch(env: Env, batch_id: u64) -> Option<cross_contract::CallBatch> {
+        cross_contract::get_batch(&env, batch_id)
+    }
+
+    /// Get all call IDs initiated by a caller.
+    pub fn cc_get_caller_calls(env: Env, caller: Address) -> Vec<u64> {
+        cross_contract::get_caller_calls(&env, &caller)
+    }
+
+    // ── Tip Sharding (#269) ──────────────────────────────────────────────────
+
+    /// Initialize the sharding system.
+    pub fn shard_init(env: Env, admin: Address, shard_count: u32, auto_rebalance: bool) {
+        sharding::init_sharding(&env, &admin, shard_count, auto_rebalance)
+    }
+
+    /// Record a tip being processed by its assigned shard.
+    ///
+    /// Returns the shard ID.
+    pub fn shard_record_tip(env: Env, sender: Address, amount: i128, tip_id: u64) -> u32 {
+        sharding::record_tip_in_shard(&env, &sender, amount, tip_id)
+    }
+
+    /// Initiate a cross-shard transfer.
+    ///
+    /// Returns the transfer ID.
+    pub fn shard_cross_transfer(
+        env: Env,
+        from_shard: u32,
+        to_shard: u32,
+        tip_id: u64,
+        amount: i128,
+        token: Address,
+    ) -> u64 {
+        sharding::cross_shard_transfer(&env, from_shard, to_shard, tip_id, amount, &token)
+    }
+
+    /// Finalize a cross-shard transfer.
+    pub fn shard_finalize_transfer(env: Env, transfer_id: u64) {
+        sharding::finalize_transfer(&env, transfer_id)
+    }
+
+    /// Trigger a manual rebalance of shards.
+    pub fn shard_rebalance(env: Env, admin: Address) {
+        sharding::rebalance(&env, &admin)
+    }
+
+    /// Get the state of a specific shard.
+    pub fn shard_get_state(env: Env, shard_id: u32) -> sharding::ShardState {
+        sharding::get_shard(&env, shard_id)
+    }
+
+    /// Get the sharding configuration.
+    pub fn shard_get_config(env: Env) -> sharding::ShardConfig {
+        sharding::get_config_pub(&env)
+    }
+
+    /// Get the shard assignment for an address.
+    pub fn shard_get_assignment(env: Env, addr: Address) -> u32 {
+        sharding::get_assignment(&env, &addr)
+    }
+
+    /// Get a cross-shard transfer record.
+    pub fn shard_get_transfer(env: Env, transfer_id: u64) -> Option<sharding::ShardTransfer> {
+        sharding::get_transfer(&env, transfer_id)
+    }
+
+    // ── Tip Validity Proofs (#270) ───────────────────────────────────────────
+
+    /// Generate a validity proof for a tip.
+    ///
+    /// Returns the proof ID.
+    pub fn vp_generate(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        tip_id: u64,
+        witness: soroban_sdk::Bytes,
+    ) -> u64 {
+        validity_proof::generate_proof(&env, &sender, &creator, &token, amount, tip_id, witness)
+    }
+
+    /// Verify a validity proof.
+    ///
+    /// Returns true if valid.
+    pub fn vp_verify(env: Env, proof_id: u64) -> bool {
+        validity_proof::verify_proof(&env, proof_id)
+    }
+
+    /// Batch-verify multiple proofs.
+    ///
+    /// Returns the count of valid proofs.
+    pub fn vp_batch_verify(env: Env, proof_ids: Vec<u64>) -> u32 {
+        validity_proof::batch_verify(&env, proof_ids)
+    }
+
+    /// Aggregate multiple proofs into a single aggregate proof.
+    ///
+    /// Returns the aggregate ID.
+    pub fn vp_aggregate(env: Env, proof_ids: Vec<u64>) -> u64 {
+        validity_proof::aggregate_proofs(&env, proof_ids)
+    }
+
+    /// Revoke a proof.
+    pub fn vp_revoke(env: Env, admin: Address, proof_id: u64) {
+        validity_proof::revoke_proof(&env, &admin, proof_id)
+    }
+
+    /// Get a validity proof by ID.
+    pub fn vp_get_proof(env: Env, proof_id: u64) -> Option<validity_proof::TipProof> {
+        validity_proof::get_proof(&env, proof_id)
+    }
+
+    /// Get the proof ID for a given tip ID.
+    pub fn vp_get_proof_for_tip(env: Env, tip_id: u64) -> Option<u64> {
+        validity_proof::get_proof_for_tip(&env, tip_id)
+    }
+
+    /// Get an aggregated proof by ID.
+    pub fn vp_get_aggregate(env: Env, agg_id: u64) -> Option<validity_proof::AggregatedProof> {
+        validity_proof::get_aggregate(&env, agg_id)
+    }
+
+    // ── Tip Verkle Trees (#273) ──────────────────────────────────────────────
+
+    /// Create a new Verkle tree.
+    ///
+    /// Returns the tree ID.
+    pub fn vk_create_tree(env: Env, owner: Address) -> u64 {
+        verkle_tree::create_tree(&env, &owner)
+    }
+
+    /// Insert or update a leaf in a Verkle tree.
+    ///
+    /// Returns the new root commitment.
+    pub fn vk_update_leaf(
+        env: Env,
+        tree_id: u64,
+        creator: Address,
+        token: Address,
+        value: soroban_sdk::Bytes,
+    ) -> BytesN<32> {
+        verkle_tree::update_leaf(&env, tree_id, &creator, &token, value)
+    }
+
+    /// Generate a Verkle proof for a leaf.
+    ///
+    /// Returns the proof ID.
+    pub fn vk_generate_proof(env: Env, tree_id: u64, leaf_index: u32) -> u64 {
+        verkle_tree::generate_proof(&env, tree_id, leaf_index)
+    }
+
+    /// Verify a Verkle proof against the current tree root.
+    ///
+    /// Returns true if valid.
+    pub fn vk_verify_proof(env: Env, proof_id: u64) -> bool {
+        verkle_tree::verify_proof(&env, proof_id)
+    }
+
+    /// Get a Verkle tree by ID.
+    pub fn vk_get_tree(env: Env, tree_id: u64) -> Option<verkle_tree::VerkleTree> {
+        verkle_tree::get_tree(&env, tree_id)
+    }
+
+    /// Get a Verkle leaf by tree ID and index.
+    pub fn vk_get_leaf(env: Env, tree_id: u64, index: u32) -> Option<verkle_tree::VerkleLeaf> {
+        verkle_tree::get_leaf(&env, tree_id, index)
+    }
+
+    /// Get a Verkle proof by ID.
+    pub fn vk_get_proof(env: Env, proof_id: u64) -> Option<verkle_tree::VerkleProof> {
+        verkle_tree::get_proof(&env, proof_id)
+    }
+
+    /// Get all tree IDs owned by an address.
+    pub fn vk_get_owner_trees(env: Env, owner: Address) -> Vec<u64> {
+        verkle_tree::get_owner_trees(&env, &owner)
+    }
+
+    /// Deactivate a Verkle tree.
+    pub fn vk_deactivate_tree(env: Env, owner: Address, tree_id: u64) {
+        verkle_tree::deactivate_tree(&env, &owner, tree_id)
     }
 }
 
