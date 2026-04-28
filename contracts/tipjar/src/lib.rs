@@ -91,8 +91,8 @@ pub mod state_channel;
 // Meta-transactions for gasless tipping
 pub mod meta_tx;
 
-// Commit-reveal scheme for fair auctions and voting
-pub mod commit_reveal;
+// Royalty splits for collaborative content and team tips
+pub mod royalty;
 
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
@@ -9550,6 +9550,112 @@ a
         let finalized_batches: u64 = env.storage().instance().get(&DataKey::RollupFinalizedCount).unwrap_or(0);
         let challenged_batches: u64 = env.storage().instance().get(&DataKey::RollupChallengedCount).unwrap_or(0);
         rollup::RollupState { enabled, sequencer, challenge_period, pending_batches, finalized_batches, challenged_batches }
+    }
+
+    // ── fractional ownership ─────────────────────────────────────────────────
+
+    /// Mint `total_supply` fractions for `creator`.
+    pub fn mint_fractions(
+        env: Env,
+        creator: Address,
+        total_supply: u64,
+        buyout_price_per_fraction: i128,
+    ) {
+        fractional_ownership::mint_fractions(&env, &creator, total_supply, buyout_price_per_fraction);
+    }
+
+    /// Record `amount` of revenue for `creator`'s fraction pool.
+    pub fn accrue_revenue(env: Env, creator: Address, amount: i128) {
+        fractional_ownership::accrue_revenue(&env, &creator, amount);
+    }
+
+    /// Claim accumulated revenue for `holder` in `creator`'s pool.
+    pub fn claim_fraction_revenue(env: Env, creator: Address, holder: Address) -> i128 {
+        fractional_ownership::claim_revenue(&env, &creator, &holder)
+    }
+
+    /// Transfer `amount` fractions from `from` to `to`.
+    pub fn transfer_fractions(
+        env: Env,
+        creator: Address,
+        from: Address,
+        to: Address,
+        amount: u64,
+    ) {
+        fractional_ownership::transfer_fractions(&env, &creator, &from, &to, amount);
+    }
+
+    /// Buy out all fractions not held by `buyer`. Returns total cost.
+    pub fn buyout_fractions(env: Env, creator: Address, buyer: Address) -> i128 {
+        fractional_ownership::buyout(&env, &creator, &buyer)
+    }
+
+    /// Returns the fraction pool for `creator`.
+    pub fn get_fraction_pool(
+        env: Env,
+        creator: Address,
+    ) -> Option<fractional_ownership::FractionPool> {
+        fractional_ownership::get_pool(&env, &creator)
+    }
+
+    /// Returns the fraction position for `holder` in `creator`'s pool.
+    pub fn get_fraction_position(
+        env: Env,
+        creator: Address,
+        holder: Address,
+    ) -> fractional_ownership::FractionPosition {
+        fractional_ownership::get_position(&env, &creator, &holder)
+    }
+
+    // ── royalty splits ───────────────────────────────────────────────────────
+
+    /// Create or replace a split configuration for `split_id`.
+    pub fn set_split(
+        env: Env,
+        split_id: Address,
+        owner: Address,
+        recipients: Vec<royalty::SplitRecipient>,
+    ) {
+        royalty::set_split(&env, &split_id, &owner, recipients);
+    }
+
+    /// Modify an existing split configuration (owner only).
+    pub fn modify_split(
+        env: Env,
+        split_id: Address,
+        owner: Address,
+        recipients: Vec<royalty::SplitRecipient>,
+    ) {
+        royalty::modify_split(&env, &split_id, &owner, recipients);
+    }
+
+    /// Distribute `amount` according to the split config for `split_id`.
+    pub fn distribute_split(env: Env, split_id: Address, amount: i128) -> i128 {
+        royalty::distribute(&env, &split_id, amount)
+    }
+
+    /// Returns the split config for `split_id`.
+    pub fn get_split(env: Env, split_id: Address) -> Option<royalty::SplitConfig> {
+        royalty::get_split(&env, &split_id)
+    }
+
+    /// Returns a split history entry by index.
+    pub fn get_split_history_entry(
+        env: Env,
+        split_id: Address,
+        index: u64,
+    ) -> Option<royalty::SplitHistoryEntry> {
+        royalty::get_history_entry(&env, &split_id, index)
+    }
+
+    /// Returns the total number of distribution history entries for `split_id`.
+    pub fn get_split_history_count(env: Env, split_id: Address) -> u64 {
+        royalty::get_history_count(&env, &split_id)
+    }
+
+    /// Returns the accumulated split balance for `recipient`.
+    pub fn get_split_balance(env: Env, recipient: Address) -> i128 {
+        royalty::get_balance(&env, &recipient)
     }
 }
 
