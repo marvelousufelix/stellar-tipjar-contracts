@@ -91,6 +91,9 @@ pub mod state_channel;
 // Meta-transactions for gasless tipping
 pub mod meta_tx;
 
+// Royalty splits for collaborative content and team tips
+pub mod royalty;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9316,6 +9319,57 @@ a
         holder: Address,
     ) -> fractional_ownership::FractionPosition {
         fractional_ownership::get_position(&env, &creator, &holder)
+    }
+
+    // ── royalty splits ───────────────────────────────────────────────────────
+
+    /// Create or replace a split configuration for `split_id`.
+    pub fn set_split(
+        env: Env,
+        split_id: Address,
+        owner: Address,
+        recipients: Vec<royalty::SplitRecipient>,
+    ) {
+        royalty::set_split(&env, &split_id, &owner, recipients);
+    }
+
+    /// Modify an existing split configuration (owner only).
+    pub fn modify_split(
+        env: Env,
+        split_id: Address,
+        owner: Address,
+        recipients: Vec<royalty::SplitRecipient>,
+    ) {
+        royalty::modify_split(&env, &split_id, &owner, recipients);
+    }
+
+    /// Distribute `amount` according to the split config for `split_id`.
+    pub fn distribute_split(env: Env, split_id: Address, amount: i128) -> i128 {
+        royalty::distribute(&env, &split_id, amount)
+    }
+
+    /// Returns the split config for `split_id`.
+    pub fn get_split(env: Env, split_id: Address) -> Option<royalty::SplitConfig> {
+        royalty::get_split(&env, &split_id)
+    }
+
+    /// Returns a split history entry by index.
+    pub fn get_split_history_entry(
+        env: Env,
+        split_id: Address,
+        index: u64,
+    ) -> Option<royalty::SplitHistoryEntry> {
+        royalty::get_history_entry(&env, &split_id, index)
+    }
+
+    /// Returns the total number of distribution history entries for `split_id`.
+    pub fn get_split_history_count(env: Env, split_id: Address) -> u64 {
+        royalty::get_history_count(&env, &split_id)
+    }
+
+    /// Returns the accumulated split balance for `recipient`.
+    pub fn get_split_balance(env: Env, recipient: Address) -> i128 {
+        royalty::get_balance(&env, &recipient)
     }
 }
 
