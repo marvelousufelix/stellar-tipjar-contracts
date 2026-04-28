@@ -36,6 +36,9 @@ pub mod conditions;
 // Dynamic fee adjustment
 pub mod fees;
 
+// Atomic hash-time-locked swaps
+pub mod swap;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TipWithMessage {
@@ -245,6 +248,10 @@ pub enum DataKey {
     Subscription(Address, Address),
     /// Human-readable reason stored when the contract is paused.
     PauseReason,
+    /// Global atomic swap counter (u64).
+    SwapCounter,
+    /// Atomic swap record by ID.
+    Swap(u64),
 }
 
 #[contracterror]
@@ -291,6 +298,16 @@ pub enum TipJarError {
     InvalidPercentage = 30,
     /// Contract is paused; state-changing operations are blocked.
     ContractPaused = 31,
+    /// Swap ID does not exist.
+    SwapNotFound = 32,
+    /// Swap is not in Pending state.
+    SwapNotPending = 33,
+    /// Provided preimage does not match the hash lock.
+    InvalidPreimage = 34,
+    /// Time lock has not yet expired.
+    TimeLockNotExpired = 35,
+    /// Time lock is not in the future.
+    InvalidTimeLock = 36,
 }
 
 #[contract]
@@ -926,5 +943,38 @@ impl TipJarContract {
                 (sender.clone(), share, r.percentage),
             );
         }
+    }
+
+    // ── atomic swaps ─────────────────────────────────────────────────────────
+
+    /// Creates a hash-time-locked swap and escrows tokens from `initiator`.
+    pub fn create_swap(
+        env: Env,
+        initiator: Address,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        hash_lock: BytesN<32>,
+        time_lock: u64,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        swap::create_swap(&env, initiator, recipient, token, amount, hash_lock, time_lock)
+    }
+
+    /// Executes a pending swap by revealing the preimage.
+    pub fn execute_swap(env: Env, id: u64, preimage: BytesN<32>) {
+        Self::require_not_paused(&env);
+        swap::execute_swap(&env, id, preimage);
+    }
+
+    /// Refunds a pending swap to the initiator after the time lock expires.
+    pub fn refund_swap(env: Env, id: u64) {
+        Self::require_not_paused(&env);
+        swap::refund_swap(&env, id);
+    }
+
+    /// Returns the swap record for the given ID.
+    pub fn get_swap(env: Env, id: u64) -> swap::AtomicSwap {
+        swap::get_swap(&env, id)
     }
 }
