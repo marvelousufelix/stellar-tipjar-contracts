@@ -111,6 +111,9 @@ pub mod validity_proof;
 // Verkle tree for efficient tip state proofs
 pub mod verkle_tree;
 
+// On-chain reputation system
+pub mod reputation;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2295,6 +2298,10 @@ impl TipJarContract {
             .set(&DataKey::Tip(TipKey::Ctr), &(tip_id + 1));
 
         Self::update_leaderboard_stats(&env, &sender, &creator, creator_amount);
+
+        // Record reputation for tipper and creator
+        reputation::record_tip_sent(&env, &sender, amount);
+        reputation::record_tip_received(&env, &creator, creator_amount);
 
         // Track which tokens this creator has received
         Self::track_creator_token(&env, &creator, &token);
